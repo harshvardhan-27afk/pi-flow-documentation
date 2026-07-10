@@ -1,7 +1,7 @@
 # PI-Flow User Guide
 
 This guide is written for people **authoring DAG files**. For every feature you get:
-a short description, edge cases/gotchas to know before you rely on it, and a code
+a short description, edge cases to know before you rely on it, and a code
 snippet showing the exact syntax to use in a Python DAG file.
 
 
