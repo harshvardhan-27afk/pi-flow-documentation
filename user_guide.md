@@ -4,8 +4,7 @@ This guide is written for people **authoring DAG files**. For every feature you 
 a short description, edge cases/gotchas to know before you rely on it, and a code
 snippet showing the exact syntax to use in a Python DAG file.
 
-All snippets use the Airflow-2.x-style API that PI-Flow's dynamic parser
-(`dag_parser/dynamic/dag_context.py`) understands.
+
 
 ---
 
@@ -1348,3 +1347,337 @@ with DAG(
 
 ---
 
+### 26. Dataset-driven trigger
+
+**Description:** A DAG scheduled with `schedule=[Dataset(...)]` (feature 2)
+runs automatically when its upstream dataset(s) receive new events, evaluated
+each scheduler tick against an `"any"` or `"all"` condition.
+
+**Edge cases:**
+- **Only one dataset-triggered run in flight at a time, regardless of
+  `max_active_runs`.** Before evaluating conditions, the evaluator skips the
+  DAG entirely if it already has a `running`/`queued` run — rapid repeated
+  dataset updates while a run is in progress do not queue up additional runs;
+  they're effectively coalesced (the next check after the current run finishes
+  will pick up all events accumulated since the *last successful* run).
+- **"Since" is anchored to the last *successful* run, not the last run.** If
+  the most recent run **failed**, the "since" timestamp does not advance — the
+  same dataset events that triggered the failed run are still considered "new"
+  on the next evaluation, so the DAG will be re-triggered again by the same
+  events rather than waiting for a fresh update.
+- **`trigger_type` is matched case-sensitively against exactly `"any"` or
+  `"all"`.** Using the explicit dict form (`schedule={"datasets": [...],
+  "trigger_type": "Any"}`) with any casing/spelling other than lowercase `any`/
+  `all` silently falls into an unrecognized-type branch that never triggers —
+  no error at ingestion, the DAG just never fires automatically. Double-check
+  spelling/case if a dataset DAG never runs.
+- `"all"` requires every listed dataset to have **at least one** event since
+  the last successful run — it does not require they update in the same
+  request/moment, just that each independently has *some* event queued up by
+  the time the check runs.
+- A task produces a dataset event by declaring `outlets=[Dataset(...)]` on the
+  operator and completing successfully — a failed producer task does not emit
+  a dataset event, so a failure upstream naturally withholds downstream
+  dataset-triggered DAGs (no partial/error events are emitted).
+
+**Code snippet:**
+```python
+from dag_parser.dynamic.dag_context import Dataset
+
+# Producer: emits a dataset event on success
+with DAG(dag_id="produce_sales", schedule="@daily", start_date=datetime(2026, 1, 1)) as dag:
+    load = PythonOperator(
+        task_id="load_sales_table",
+        python_callable=lambda: None,
+        outlets=[Dataset("s3://bucket/sales_table")],
+    )
+
+# Consumer: runs automatically once the dataset above gets a new event
+with DAG(
+    dag_id="consume_sales",
+    schedule=[Dataset("s3://bucket/sales_table")],
+    start_date=datetime(2026, 1, 1),
+) as dag:
+    ...
+```
+
+---
+
+### 27. Cross-DAG trigger
+
+**Description:** `TriggerDagRunOperator(trigger_dag_id=..., conf=..., ...)`
+lets one task start a run of a **different** DAG. Optionally,
+`wait_for_completion=True` makes the parent task wait (non-blockingly — see
+edge cases) until the child run reaches an allowed or failed state.
+
+**Edge cases:**
+- **The child DAG must exist and be unpaused**, or the task fails immediately
+  with an explicit error — a paused child DAG is treated the same as a
+  nonexistent one from the trigger task's perspective.
+- **`conf` passed to the child is NOT validated against the child DAG's
+  `params` schema** — unlike a UI/API manual trigger's `params` field (feature
+  24), `TriggerDagRunOperator`'s `conf` goes straight into the child's
+  `dag_run.conf` unchecked. A typo'd key or wrong type in `conf` won't be
+  caught until the child DAG's own tasks try to use it (likely a template
+  rendering failure deep inside the child run, not an obvious error up front).
+- **`wait_for_completion=True` does NOT hold a worker slot** — the parent task
+  returns immediately into a `waiting_for_child` state; a background scheduler
+  phase (the deferred-task reconciler) polls the child's `dag_run` state and
+  flips the parent to success/failed later. This means it's safe even on a
+  single-worker cluster with deeply nested trigger chains — no deadlock risk
+  from blocking slots.
+- **`allowed_states`/`failed_states` default to `["success"]`/`["failed"]`.**
+  If the child ends up in some other state that's in neither list, the parent
+  simply **stays in `waiting_for_child` indefinitely** — there's no separate
+  timeout on the wait itself (only the DAG-level `dagrun_timeout_seconds` /
+  global stale-run fallback would eventually catch a truly stuck parent run).
+- **Verified: `poke_interval=` on `TriggerDagRunOperator` is accepted but has
+  no effect.** The executor that actually creates the child run and the
+  reconciler that later checks its state don't read this parameter at all —
+  it's dead syntax carried over from the Airflow-style API surface. The real
+  poll cadence is just the scheduler's normal iteration interval.
+- The generated child `run_id` is always `triggered__<parent_run_id>__<timestamp>`
+  — you don't control or predict it in the DAG file; read it back via XCom
+  (`trigger_run_id`) if a downstream task needs it.
+
+**Code snippet:**
+```python
+from dag_parser.dynamic.dag_context import TriggerDagRunOperator
+
+with DAG(dag_id="parent_pipeline", schedule="@daily", start_date=datetime(2026, 1, 1)) as dag:
+
+    trigger_child = TriggerDagRunOperator(
+        task_id="trigger_child",
+        trigger_dag_id="child_pipeline",
+        conf={"batch_date": "{{ .DS }}"},   # NOT validated against child's params schema
+        wait_for_completion=True,
+        allowed_states=["success"],
+        failed_states=["failed"],
+    )
+```
+
+---
+
+### 28. Time-based defer
+
+**Description:** Instead of holding a worker slot while waiting, a task can
+call `self.defer(trigger, method_name=..., timeout=...)` to register a trigger
+and free the slot immediately; the **triggerer** (a separate polling loop,
+default every 5s) evaluates the trigger and flips the task back to `scheduled`
+when it fires. Three trigger types: `TimeDeltaTrigger(delta)` (fire after an
+elapsed duration), `DateTimeTrigger(moment)` (fire at a specific timestamp),
+and `HttpTrigger(endpoint, ...)` (fire when an endpoint returns the expected
+status). `TimeSensor(target_time=...)` is the ready-made operator wrapping
+similar "wait until a time of day" semantics without writing your own defer
+logic.
+
+**Edge cases:**
+- **`TimeDeltaTrigger`'s elapsed time is measured from when `defer()` was
+  called** (when the `trigger_instance` row was created), not from the DAG
+  run's logical date or task start — two tasks in the same run that call
+  `defer(TimeDeltaTrigger(60))` at different wall-clock moments fire 60 seconds
+  after their own respective defer call, not in sync with each other.
+- **`DateTimeTrigger(moment)` accepts a `datetime` or ISO string, but a naive
+  (timezone-unaware) `datetime` is treated as UTC** by the triggerer's parser
+  — there's no DAG-timezone adjustment applied to this specific trigger the
+  way cron scheduling gets DAG-timezone treatment (feature 3). Pass a
+  timezone-aware datetime or an explicit UTC-equivalent string if you need
+  precision.
+- **`HttpTrigger` treats network errors as "not fired yet," not as a
+  failure.** An endpoint that's down or unreachable just means the trigger
+  keeps polling silently — it will not error out on its own. The only thing
+  that eventually stops an endlessly-unreachable `HttpTrigger` is the
+  `timeout=` you pass to `defer()` (if set) or the trigger's own
+  `trigger_instance.timeout_at`; without a timeout, it can poll forever.
+- **`TimeSensor` defaults to `mode="reschedule"`** (frees the worker slot
+  between pokes) rather than `mode="poke"` (holds the slot the whole time) —
+  this matters for worker capacity planning: many concurrent `poke`-mode
+  sensors can exhaust `MaxLocalTasks`/pool slots, while `reschedule`-mode ones
+  don't hold anything between checks.
+- A deferred/sensor task belongs to the **Sensor** executor class, which is
+  only blocked at the `Critical` admission level (not `Elevated`) — sensors get
+  more lenient scheduling priority than regular `Local`-class Python/Bash
+  tasks under load.
+
+**Code snippet:**
+```python
+from dag_parser.dynamic.dag_context import BaseOperator, TimeDeltaTrigger
+from dag_parser.dynamic.operators import TimeSensor
+
+# Ready-made sensor: wait until a specific time of day
+wait_until_6am = TimeSensor(
+    task_id="wait_until_6am",
+    target_time="06:00",
+    mode="reschedule",   # frees the worker slot between checks (default)
+)
+
+# Manual defer: a custom operator that waits 5 minutes, non-blockingly
+class DelayedStep(BaseOperator):
+    operator_name = "DelayedStep"
+
+    def execute(self, context):
+        self.defer(
+            trigger=TimeDeltaTrigger(300),
+            method_name="execute_complete",
+            timeout=600,   # give up (fail) if it hasn't fired within 10 minutes
+        )
+```
+
+---
+
+## Category: Dependencies & flow
+
+### 29. Declare edges
+
+**Description:** Wire task dependencies with `>>` (downstream), `<<`
+(upstream), or the explicit `set_upstream(other)` / `set_downstream(other)`
+methods. Both operators accept a single task or a list of tasks on either side
+for simple fan-out/fan-in.
+
+**Edge cases:**
+- `a >> b` returns `b`, which is what makes chaining work: `a >> b >> c` is
+  `(a >> b) >> c`. `a << b` (meaning "a depends on b") returns `b` as well —
+  so `a << b << c` chains as `(a << b) << c`, producing `c -> b -> a` (each
+  further left-shift adds one more upstream layer), matching the intuitive
+  reading "a comes after b, which comes after c."
+- **Fan-out/fan-in with a list on ONE side works fine**: `a >> [b, c]`
+  (one-to-many), `[b, c] >> d` (many-to-one), and the `<<` equivalents all
+  work correctly — verified.
+- **Verified limitation: a list on BOTH sides raises a `TypeError` at DAG
+  parse time**, breaking ingestion for that file. `[a, b] >> [c, d]` is
+  **not** supported — neither `list` has a `>>`/`<<` operator implementation
+  on either side, so Python has no method to dispatch to. Airflow supports
+  this pattern via internal `EdgeModifier` machinery; PI-Flow's parser mock
+  does not replicate it. Expand it into explicit pairs instead (see snippet).
+- `set_downstream`/`set_upstream` accept `list`, `tuple`, or `set` for the
+  `other` argument — mixing task objects and something else (e.g. a raw
+  string task_id) in that collection will fail, since the code always calls
+  `.task_id` on each element.
+- These calls only build the **dependency graph** — they don't return
+  anything meaningful about execution order at DAG-authoring time; the actual
+  ready/blocked/skip decision per task is governed by `trigger_rule`
+  (feature 3 below, and feature 14 in Per-task customization).
+
+**Code snippet:**
+```python
+with DAG(dag_id="edges_demo", schedule="@daily", start_date=datetime(2026, 1, 1)) as dag:
+    extract = PythonOperator(task_id="extract", python_callable=lambda: None)
+    validate = PythonOperator(task_id="validate", python_callable=lambda: None)
+    transform = PythonOperator(task_id="transform", python_callable=lambda: None)
+    load_a = PythonOperator(task_id="load_a", python_callable=lambda: None)
+    load_b = PythonOperator(task_id="load_b", python_callable=lambda: None)
+    report = PythonOperator(task_id="report", python_callable=lambda: None)
+
+    # Simple chain
+    extract >> validate >> transform
+
+    # Fan-out: one task to many (list on ONE side — supported)
+    transform >> [load_a, load_b]
+
+    # Fan-in: many tasks to one (list on ONE side — supported)
+    [load_a, load_b] >> report
+
+    # NOT supported: [load_a, load_b] >> [report, some_other_task] (list >> list
+    # raises TypeError at parse time). Expand it explicitly instead:
+    # for src in [load_a, load_b]:
+    #     for dst in [report, some_other_task]:
+    #         src >> dst
+
+    # Equivalent explicit-method form of the chain above:
+    validate.set_upstream(extract)
+```
+
+---
+
+### 30. Edge labels
+
+**Description:** `Label("text")` is meant to visually annotate an edge for the
+task-graph UI — e.g. `task_a >> Label("on_success") >> task_b` — without
+affecting execution semantics.
+
+**Edge cases:**
+- **Verified bug: the documented `>>`-chaining syntax for `Label(...)` raises
+  an `AttributeError` and crashes DAG parsing.** Tracing (and empirically
+  running) `task_a >> Label("mylabel") >> task_b` against the current
+  `dag_context.py` throws
+  `AttributeError: 'Label' object has no attribute 'task_id'`. This happens
+  because `Task.__rshift__` unconditionally calls `self.set_downstream(other)`
+  on whatever sits on the right of `>>`, and `set_downstream` tries to read
+  `.task_id` off it — a `Label` object has no such attribute, and Python
+  resolves `task_a >> Label(...)` to `Task.__rshift__`, not the `Label`
+  class's own `__rrshift__`, because `Label` isn't a subclass of `Task`. Using
+  the docstring's own example syntax will break ingestion for that DAG file.
+- **Working alternative (verified):** call `set_downstream`/`set_upstream`
+  directly with the `label=` keyword argument instead of the `>> Label(...) >>`
+  chain — this correctly populates `edge_labels` and does not crash:
+  `task_a.set_downstream(task_b, label="on_success")`.
+- Even when populated correctly, edge labels are **purely cosmetic** — they
+  show up in the task-graph visualization only and have zero effect on
+  trigger-rule evaluation, scheduling, or execution order.
+
+**Code snippet:**
+```python
+with DAG(dag_id="edge_labels_demo", schedule="@daily", start_date=datetime(2026, 1, 1)) as dag:
+    check = PythonOperator(task_id="check", python_callable=lambda: None)
+    proceed = PythonOperator(task_id="proceed", python_callable=lambda: None)
+
+    # DO NOT use: check >> Label("on_success") >> proceed
+    #   -> raises AttributeError: 'Label' object has no attribute 'task_id'
+    #      (verified against the current dag_context.py)
+
+    # Use this instead — functionally identical, and it actually works:
+    check.set_downstream(proceed, label="on_success")
+```
+
+---
+
+### 31. Convergence control
+
+**Description:** When multiple upstream branches/edges converge on one task
+(a "join" point), that task's `trigger_rule` (feature 14 in Per-task
+customization) decides what upstream state combination makes it ready,
+skipped, or permanently blocked — this is the mechanism that actually governs
+convergence behavior, not the edges themselves.
+
+**Edge cases:**
+- Declaring the edges (feature 1) only builds the graph; it never implies a
+  join semantics on its own. A task with 3 upstream edges and the default
+  `trigger_rule="all_success"` requires **all 3** to succeed — if you want
+  "any one of these 3 finishing is enough," you must explicitly set
+  `trigger_rule="one_success"` (or another applicable rule) on the converging
+  task — the edges alone never imply "any" semantics.
+- **Classic branch-then-join pattern**: after a `BranchPythonOperator` skips
+  every path except one, a naive `all_success` join downstream of all
+  branches would never be satisfied (the skipped branches aren't "success").
+  Use `none_failed` or `none_failed_min_one_success` on the join task so
+  skip-propagation from the unchosen branches doesn't permanently block it —
+  this is the single most common reason a "task never runs" turns out to be a
+  convergence trigger-rule mismatch, not a scheduling bug.
+- A converging task only re-evaluates its rule once its upstream state counts
+  change meaningfully — for rules like `all_success`/`all_done` it effectively
+  waits for every incoming edge's task to reach a terminal state before it can
+  resolve, even if 9 of 10 upstream branches finished quickly and one is slow.
+- Mixing trigger rules across parallel converging tasks fed by the *same*
+  upstream fan-out is fine and common — e.g. one join task using
+  `one_success` for a "fast path" notification, and another using
+  `all_success` for the "everything must have worked" gate, both reading the
+  same set of upstream edges independently.
+
+**Code snippet:**
+```python
+with DAG(dag_id="convergence_demo", schedule="@daily", start_date=datetime(2026, 1, 1)) as dag:
+
+    choose_path = PythonOperator(task_id="choose_path", python_callable=lambda: None)
+    # (BranchPythonOperator would return one of these task_ids at runtime)
+    path_a = PythonOperator(task_id="path_a", python_callable=lambda: None)
+    path_b = PythonOperator(task_id="path_b", python_callable=lambda: None)
+
+    # Converges after a branch — must tolerate the unchosen path being 'skipped'
+    join_after_branch = PythonOperator(
+        task_id="join_after_branch",
+        python_callable=lambda: None,
+        trigger_rule="none_failed_min_one_success",
+    )
+
+    choose_path >> [path_a, path_b] >> join_after_branch
+```
