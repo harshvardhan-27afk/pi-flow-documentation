@@ -608,10 +608,6 @@ with DAG(
 
 ## Category: Per-task customization
 
-> Note: the next 3 features (13–15) configure individual **tasks/operators**,
-> not the `DAG` object itself — they're listed here because they were requested
-> alongside the DAG-level batch, but syntactically they go on the operator call
-> (e.g. `PythonOperator(...)`), not inside `DAG(...)`.
 
 ### 13. Retry policy
 
@@ -1177,7 +1173,7 @@ PythonVirtualenvOperator(
 
 ---
 
-This closes out the **Per-task customization** category.
+
 
 ---
 
