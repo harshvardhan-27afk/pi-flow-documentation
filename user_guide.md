@@ -3667,3 +3667,1067 @@ with DAG(dag_id="orchestrator", schedule="@daily", start_date=datetime(2026, 1, 
     [trigger_child, wait_for_sibling]
 )
 ```
+
+---
+
+## Category: In-app: DAGs
+
+> Note: this category and everything after it documents the **UI/API surface**
+> (what an operator does through the web app or REST API), not DAG-file
+> Python syntax — there is no `with DAG(...)` snippet for these; the code
+> blocks below show the actual HTTP request/response shape instead.
+
+### 65. Pause/unpause
+
+**Description:** `PATCH /api/dags/{dag_id}` with `{"is_paused": true|false}`
+toggles a DAG's paused state — the switch behind the UI's Pause/unpause
+toggle. Handled by `DagsHandler.PatchDag` → `DAGRepository.UpdateDAGPausedState`,
+a single `UPDATE DAG SET IS_PAUSED = $1 WHERE DAG_ID = $2`.
+
+**Edge cases:**
+- **`is_paused` must be explicitly present in the JSON body, not just any
+  truthy field.** The handler binds into a `*bool` and checks for `nil` —
+  sending `{}` (or omitting the key entirely) returns `400 "is_paused field
+  is required"` rather than defaulting to a no-op.
+- **This is completely independent of `is_active`** (the ingestion-managed
+  flag that flips when a DAG's file is removed from Git — doc 06). The PATCH
+  only ever touches `IS_PAUSED`; pausing a DAG whose file was since deleted
+  from the repo has no additional effect, since the scheduler already
+  excludes it via `is_active`.
+- **Verified: the scheduler consults the paused flag in exactly one place —
+  `GetActiveDAGs()`'s `WHERE is_paused = FALSE AND is_active = TRUE` clause**
+  (feeding the cron-eval phase), and the dataset-trigger evaluator repeats
+  the identical `is_paused = FALSE AND is_active = TRUE` filter independently
+  in its own query. Pausing takes effect on the **next scheduler tick**
+  (~30s), not instantly, and blocks both cron/timetable-driven **and**
+  dataset-driven automatic run creation equally.
+- **Only new automatic run creation is blocked** — a run already
+  `queued`/`running` at the moment you pause keeps going through planning,
+  dispatch, and finalization untouched, because those phases operate
+  directly on existing `dag_run`/`task_instance` rows, not on the
+  paused-DAG filter.
+- **A paused DAG also can't be manually triggered** (feature 24) — the
+  trigger request is rejected outright, so pause doubles as "block all new
+  runs, automatic or manual," not just the cron side.
+- No dedicated audit-log entry is written for this action specifically —
+  `PatchDag` has no `audit.Log`-style call, unlike some other admin mutation
+  endpoints (doc 04's audit-log coverage doesn't reach this one).
+
+**Code snippet:**
+```
+# Pause a DAG — stops new automatic AND manual runs; already in-flight runs continue
+PATCH /api/dags/sales_daily_report
+Content-Type: application/json
+
+{"is_paused": true}
+
+# -> 200 {"dag_id": "sales_daily_report", "is_paused": true}
+
+# Unpause
+PATCH /api/dags/sales_daily_report
+{"is_paused": false}
+
+# Omitting the key entirely is a 400, not a no-op:
+PATCH /api/dags/sales_daily_report
+{}
+# -> 400 {"error": "is_paused field is required"}
+```
+
+---
+
+### 66. View source & graph
+
+**Description:** Two independent, unrelated endpoints back this one UI
+feature. `GET /api/dags/{dag_id}/tasks/graph` returns the static task
+dependency graph (`{dag_id, tasks: [{taskId, dependsOn, operator}]}`), built
+fresh on every call from the live `task`/`task_dependency` tables.
+`GET /api/github/raw?file=<filename>` serves the DAG's raw Python source —
+local checkout first, GitHub raw as fallback — and is **not scoped by
+`dag_id` at all**, only by filename.
+
+**Edge cases:**
+- **The graph is built from the current `task`/`task_dependency` tables, NOT
+  the frozen `dag_version` snapshot** (doc 01/02) that a running `dag_run` is
+  actually pinned to — editing and re-ingesting the DAG file changes what
+  this endpoint shows immediately, even for a DAG run currently executing
+  against an older, frozen version. What you see in the graph view can
+  diverge from what a specific in-flight run is actually structured as.
+- **`file` is reduced to `filepath.Base(file)` before lookup** (path-traversal
+  guard, doc 04) — you cannot pass the DAG's `fileloc` verbatim (e.g.
+  `dags/sales/daily_report.py`); only the basename is used. Two DAG files
+  with the same filename in different subdirectories are indistinguishable
+  to this endpoint — whichever one is actually on disk at that basename is
+  what gets served, regardless of which `dag_id` you were viewing when you
+  clicked "view source."
+- **Local-first, GitHub-fallback, silently.** It tries
+  `$DAGS_REPO_PATH/<basename>` first and only reaches out to
+  `raw.githubusercontent.com` (hardcoded owner/repo/branch/path via env
+  vars, independent of the ingestion service's own `GIT_REPO_URL`) if the
+  local file is missing — a stale or out-of-sync local checkout silently
+  masks whatever is actually latest on GitHub, with no indication in the
+  response of which source was used.
+- **The graph endpoint 404s only on a missing `dag_id`** — a DAG that
+  exists but has zero task rows (e.g. it failed to fully ingest) returns a
+  normal `200` with `tasks: []`, not an error.
+- **Dangling dependency rows are dropped silently, not surfaced.** If
+  `task_dependency` references a `task_id` no longer present in `task`
+  (e.g. a partial/inconsistent ingestion), that edge is skipped with a
+  server-side warning log only — the API response simply under-represents
+  the real dependency data with no client-visible indication anything was
+  dropped.
+- Both the top-level task list and each task's `dependsOn` array are sorted
+  **alphabetically** for deterministic output — this ordering carries no
+  execution-order meaning (it is not a topological sort); don't read graph
+  array order as run order.
+
+**Code snippet:**
+```
+GET /api/dags/sales_daily_report/tasks/graph
+-> 200
+{
+  "dag_id": "sales_daily_report",
+  "tasks": [
+    {"taskId": "build_report", "dependsOn": [], "operator": "PythonOperator"},
+    {"taskId": "email_report", "dependsOn": ["build_report"], "operator": "EmailOperator"}
+  ]
+}
+
+# Decoupled from dag_id entirely — only the basename matters:
+GET /api/github/raw?file=sales_daily_report.py
+-> 200 text/plain
+# raw .py source: local dags-repo checkout first, GitHub raw fallback
+```
+
+---
+
+### 67. Search/filter
+
+**Description:** `GET /api/dags` accepts `search`, `tags`, `owner`,
+`is_paused`, `last_run_state`, `sort`, and `order` query params. Supplying
+**any** of them switches the handler from the plain `GetAllDags` query to
+`GetAllDagsFiltered`, which builds a dynamic `WHERE`/`ORDER BY` clause.
+
+**Edge cases:**
+- **`search` is one param matching THREE columns at once** —
+  `dag_id ILIKE OR owners ILIKE OR description ILIKE` against the same
+  substring. You cannot scope a search to "dag_id only"; a search term that
+  happens to appear in a description will surface DAGs you weren't
+  necessarily looking for by ID.
+- **Verified: `owner=` filters a column that's never actually populated.**
+  Per feature 1's confirmed gap, `owners` from the DAG file is silently
+  dropped at ingestion, and no webserver write-path was found that sets it
+  either — in practice, filtering by `owner=` reliably returns nothing
+  today, regardless of what you pass.
+- **`tags=` is a raw substring match against the column's JSON-encoded
+  string form** (`["sales","reporting","daily"]`, feature 1), not an
+  exact-tag match against a real array. `tags=ale` matches a DAG tagged
+  `sales`; there is no way to require an exact tag or AND multiple tags —
+  only one substring against the whole JSON blob per request.
+- **`is_paused=` only recognizes the literal string `"true"`.** Anything
+  else you pass — `"1"`, `"True"`, `"yes"`, a typo — is silently coerced to
+  `false` (`isPausedStr == "true"`), not rejected or ignored; a caller
+  expecting "any truthy value works" will get the opposite of what they
+  intended.
+- **`sort=` only recognizes exactly two allowlisted values: `dag_id` and
+  `last_run_date`.** Anything else (a typo, an unsupported field like
+  `owner` or `is_paused`) is silently ignored and falls back to sorting by
+  `dag_id` — no error, no indication the sort was dropped.
+- **There is no pagination at this endpoint at all** — filtered or not,
+  every call returns the **entire** matching result set in one response;
+  there's no `limit`/`offset`/cursor param, so a large DAG catalog means a
+  correspondingly large single JSON payload.
+
+**Code snippet:**
+```
+GET /api/dags?search=sales&is_paused=false&sort=last_run_date&order=desc
+-> 200 {"dags": [ {...}, {...} ], "total": 2}
+
+# owner= filters a column that's never populated from the DAG file — reliably empty:
+GET /api/dags?owner=data-team
+-> 200 {"dags": [], "total": 0}
+```
+
+---
+
+### 68. Params form
+
+**Description:** `GET /api/dags/{dag_id}/params` returns just
+`{dag_id, params: <params_schema JSON>}`, read straight off `dag.params_schema`
+— the same schema declared via `Param(...)` in the DAG file (feature 8). The
+UI fetches this to render the trigger dialog's form fields before a user
+fills them in and triggers a run (feature 24), rather than pulling it from
+the fuller `GET /api/dags/{dag_id}` payload.
+
+**Edge cases:**
+- **`params: {}` is returned both for "this DAG declares no params" AND for
+  "the stored `params_schema` JSON failed to parse."** `GetParamsSchema`
+  swallows a `json.Unmarshal` error silently (`if jsonErr == nil`) and just
+  leaves the response map at its initialized empty value either way — a
+  form-rendering client cannot distinguish a genuinely param-less DAG from
+  one whose schema is corrupted, without some other signal.
+- **This endpoint only ever returns the declared schema, never
+  current/previous trigger values.** Every time the trigger form opens, it
+  reflects only the DAG's static `Param(default=...)` values (feature 8) —
+  there's no "last used values" or per-user memory merged in here.
+- **Not version-pinned** — like feature 66's graph, this always reads the
+  **live** `dag` row's `params_schema` (latest ingested DAG file), not a
+  frozen `dag_version` snapshot. In practice this doesn't create a mismatch,
+  since a manual trigger right afterward also pins to that same latest
+  version (feature 24) — but it's worth knowing this route bypasses
+  `dag_version` entirely.
+- **Same trigger-time validation gap as feature 24 applies to whatever this
+  form submits back:** only `string`/`integer`/`boolean` typed params are
+  actually validated when supplied through the `params` field at trigger
+  time; a form field rendered for a `number`/`array`/`object`/`date`/
+  `datetime` param will fail validation if the user actually fills it in
+  and submits via `params` — the workaround remains the legacy `conf` field.
+- A DAG that doesn't exist returns `404 "DAG not found"` here, same as
+  `GET /api/dags/{dag_id}` — but a DAG that exists with truly no `params`
+  key in its `params_schema` column still returns a `200` (see first edge
+  case), not a 404.
+
+**Code snippet:**
+```
+GET /api/dags/etl_orders/params
+-> 200
+{
+  "dag_id": "etl_orders",
+  "params": {
+    "run_date": {"type": "string", "required": true, "pattern": "^\\d{4}-\\d{2}-\\d{2}$"},
+    "customer_id": {"type": "integer", "default": 0, "minimum": 0},
+    "mode": {"type": "string", "enum": ["full", "incremental"], "default": "incremental"}
+  }
+}
+
+# UI renders form inputs from the schema above, then triggers with:
+POST /api/dags/etl_orders/trigger
+{"params": {"run_date": "2026-07-14", "customer_id": 42, "mode": "full"}}
+```
+
+---
+
+## Category: In-app: Runs
+
+### 69. Trigger run
+
+**Description:** `POST /api/dags/{dag_id}/trigger` (optional body
+`{execution_date, conf}` or `{execution_date, params}`) is the UI's
+"Trigger" button — the HTTP-facing counterpart to feature 24. Beyond
+validating and inserting a `queued` `dag_run` row, this handler additionally
+runs an **inline fast-path**: within the same HTTP request, it plans the
+run's tasks and pushes them straight into the worker pool's dispatch
+channel, instead of waiting for the scheduler's next ~30s poll.
+
+**Edge cases:**
+- **Idempotent by construction:** `run_id = {dag_id}_manual__{execution_date_iso8601}`
+  — re-POSTing the same `execution_date` returns the existing run with
+  `200 OK` and `"message": "DAG run already exists for this execution_date"`
+  instead of creating a duplicate, rather than the fresh `201 Created` a new
+  trigger gets.
+- **Verified: the inline dispatch is best-effort and fails completely
+  silently from the caller's perspective.** If planning, the
+  `tasks_created` flag update, the state transition, the transaction
+  commit, or pushing into the dispatch channel fails for any reason
+  (channel full, a DB hiccup, or the dispatch channel simply not being
+  wired in a scheduler-only build), the handler just logs a warning and
+  returns — the HTTP response is completely unaffected and still reports
+  success. The run just falls back to the scheduler's normal ~30s poll
+  instead of starting near-instantly; nothing in the response tells you
+  which path actually happened.
+- **Verified: the JSON response's `state` field is hardcoded to
+  `"queued"`, even when inline dispatch already succeeded and flipped the
+  DB row to `"running"` moments earlier in the same request.** Don't trust
+  the trigger response's `state` as current truth — re-fetch via feature
+  72's endpoint immediately after if you need the real state.
+- `execution_date` accepts exactly three formats — full RFC3339
+  (`2026-01-29T00:00:00Z`), a bare `Z`-suffixed variant, or a plain date
+  (`2026-01-29`) — anything else 400s as `INVALID_EXECUTION_DATE` before
+  `params`/`conf` are even looked at.
+- Same params-vs-conf precedence and typed-validation gap as feature 24
+  (`number`/`array`/`object`/`date`/`datetime` params fail validation if
+  submitted via `params`; use `conf` to bypass).
+
+**Code snippet:**
+```
+POST /api/dags/etl_orders/trigger
+Content-Type: application/json
+
+{
+  "execution_date": "2026-07-14T00:00:00Z",
+  "params": {"run_date": "2026-07-14", "customer_id": 42, "mode": "full"}
+}
+
+# -> 201 Created (new run; may already be "running" in the DB via inline
+#    dispatch, even though this response always says "state": "queued")
+{
+  "dag_id": "etl_orders",
+  "run_id": "etl_orders_manual__2026-07-14T00:00:00Z",
+  "run_type": "manual",
+  "state": "queued",
+  "execution_date": "2026-07-14T00:00:00Z"
+}
+
+# Re-POSTing the identical execution_date returns the SAME run, 200 not 201:
+# -> 200 {"...", "message": "DAG run already exists for this execution_date"}
+```
+
+---
+
+### 70. Backfill range
+
+**Description:** `POST /api/dags/{dag_id}/backfill`
+(`{start_date, end_date, reset_existing, conf}`) is the UI's backfill-range
+action — the HTTP entry point behind feature 25. It re-derives every
+scheduled `execution_date` in range from the DAG's own cron string via
+`CalculateAllMissedRuns`, then bulk-inserts `run_type='backfill'` rows.
+
+**Edge cases:**
+- **`ErrNoSchedule` fires on exactly three `schedule_interval` values: the
+  empty string, the literal string `"None"`, and the literal string
+  `"@once"`** — confirming feature 25's claim that one-shot and (by
+  extension, since they carry no cron string at all) timetable-scheduled
+  DAGs can't use this endpoint; the check is a plain string comparison, not
+  a semantic "is this DAG timetable-scheduled" check.
+- **Verified: `reset_existing=true`'s delete and the subsequent bulk-insert
+  are two separate, non-transactional calls.** If `DeleteDAGRunsInRange`
+  succeeds but `BulkInsertBackfillRuns` then fails for any reason (a DB
+  error, a constraint violation), the date range has already been wiped
+  with nothing put back — there is no wrapping transaction to roll the
+  delete back. This is the same "delete now, hope the reload works"
+  pattern as feature 59's `truncate=True` COPY.
+- **Two separate safety caps exist, but only one is actually reachable
+  from the API.** Date calculation itself is capped at 1000 results
+  internally (`CalculateAllMissedRuns(..., maxRuns=1000)`), but the
+  endpoint rejects anything **over 500** before ever reaching the insert
+  step — so in practice the 500-run rejection (feature 25) always fires
+  first; the inner 1000 cap only matters if that limit is changed in code.
+- `start_date` is shifted back by exactly one second
+  (`startDate.Add(-time.Second)`) before being used as the cron walk's base
+  time, specifically so a cron tick landing exactly on `start_date` itself
+  is included rather than skipped as "before the window."
+- The response's `count` reflects **rows actually inserted**
+  (`ON CONFLICT DO NOTHING`), which can be lower than the number of dates
+  computed if some already existed in the range — re-running the same
+  backfill request (without `reset_existing`) is safe and just reports a
+  smaller `count` the second time.
+- Same date formats as trigger (RFC3339, plain date, or a bare
+  no-offset datetime) are accepted for `start_date`/`end_date` — no
+  timezone conversion beyond straight parsing; a naive date like
+  `"2026-01-01"` is treated as UTC midnight regardless of the DAG's own
+  `timezone` (feature 3).
+
+**Code snippet:**
+```
+POST /api/dags/daily_aggregation/backfill
+Content-Type: application/json
+
+{
+  "start_date": "2026-01-01",
+  "end_date": "2026-01-31",
+  "reset_existing": false
+}
+
+# -> 201 Created
+{
+  "dag_id": "daily_aggregation",
+  "runs": ["daily_aggregation_backfill__2026-01-01T00:00:00Z", "..."],
+  "count": 31
+}
+
+# A DAG with schedule="@once", schedule=None, or a named timetable=:
+# -> 400 {"error": "DAG has no schedule", "code": "NO_SCHEDULE"}
+```
+
+---
+
+### 71. Delete run
+
+**Description:** `DELETE /api/dags/{dag_id}/runs/{run_id}` removes a single
+`dag_run` row outright — a plain
+`DELETE FROM metadata.dag_run WHERE dag_id=$1 AND run_id=$2`. Because every
+dependent table (`task_instance`, and transitively `xcom`,
+`trigger_instance`) declares `ON DELETE CASCADE` back to `dag_run`
+(doc 06), this one row delete cascades to wipe the run's entire task
+history in the same statement.
+
+**Edge cases:**
+- **Verified, no state guard at all: nothing stops you from deleting a
+  `running`/`queued` run.** The repository issues the `DELETE`
+  unconditionally — it never checks `state` first. Deleting an in-flight
+  run does **not** cancel the worker goroutines/subprocesses currently
+  executing its tasks; they keep running to completion (or their own
+  timeout) with their `task_instance` row already gone. Any state-flush
+  `UPDATE` those in-flight tasks attempt afterward simply matches zero
+  rows and is silently a no-op — no error surfaces anywhere, but the run's
+  history is already gone, and any XCom those orphaned tasks try to
+  push/pull fails since its `task_instance` FK target no longer exists.
+- **This is a genuine, irreversible delete** — unlike a "clear" action
+  (which resets state so tasks re-run under the same `run_id`), there is no
+  soft-delete/undo; the `dag_run` row and everything cascaded from it is
+  gone permanently.
+- **Not-found is a real `404`, distinguished from a generic failure:** the
+  repository returns the sentinel `sql.ErrNoRows` specifically when zero
+  rows were affected, which the handler checks with `errors.Is` to return
+  `404 "DAG run not found"` rather than a `500`.
+- `run_id` is URL-decoded with `url.PathUnescape` before use (same
+  reasoning as feature 72) — required because manual/backfill run_ids
+  embed a colon- and, for some timezone offsets, `+`-bearing ISO8601
+  timestamp that must survive being placed in a URL path segment.
+- **There is no bulk/range delete at this endpoint** — contrast with
+  backfill's `reset_existing=true` (feature 70), which deletes a whole
+  date range in one call; this endpoint only ever removes exactly one
+  `(dag_id, run_id)` pair per request.
+
+**Code snippet:**
+```
+DELETE /api/dags/sales_daily_report/runs/sales_daily_report_manual__2026-07-14T00%3A00%3A00Z
+
+# -> 200 {"message": "DAG run deleted", "dag_id": "sales_daily_report", "run_id": "..."}
+# -> 404 {"error": "DAG run not found"}   if the run doesn't exist
+
+# NOTE (verified): nothing stops you from deleting a run that is still
+# `running` — its in-flight tasks are NOT cancelled, they just lose their
+# task_instance row (cascaded away) mid-execution.
+```
+
+---
+
+### 72. View run detail
+
+**Description:** `GET /api/dags/{dag_id}/runs/{run_id}` returns run-level
+metadata (`state`, `execution_date`, `start_time`, `end_time`, a
+server-computed `duration_seconds`) for the run detail page;
+`GET .../runs/{run_id}/tasks` returns the per-task state list used to
+overlay onto the task graph (feature 66) — each task's **latest try only**.
+
+**Edge cases:**
+- **`run_id` is URL-decoded with `url.PathUnescape`, deliberately not
+  `QueryUnescape`.** A manual/backfill `run_id` can embed a `+` (from a
+  timezone-offset-bearing timestamp); `QueryUnescape` would turn that `+`
+  into a literal space, corrupting the lookup. If you're building your own
+  client against this API, decode/encode the same way — a naive
+  URL-decode step can silently 404 a run that actually exists.
+- **`duration_seconds` for a still-`running` run is computed live as
+  `NOW() - start_date` at the moment of the request, not a ticking
+  value.** It's a snapshot; polling (or the WebSocket state-push, doc 04)
+  is what makes it feel "live" in the UI — the field itself doesn't update
+  on its own between requests.
+- **The `/tasks` (and legacy `/task-instances`) view collapses retries:
+  for any task with `try_number > 1`, only the highest `try_number` row is
+  returned** (`ROW_NUMBER() OVER (PARTITION BY task_id ORDER BY try_number
+  DESC)`), so earlier failed attempts are invisible from this endpoint —
+  you'd need the task's own log files/task-detail view (doc 07's "Task
+  detail" feature) to see prior-try history, not this run-level task list.
+- **The two "not found" checks aren't symmetric across routes under the
+  same `/runs/:run_id` group.** `GetDagRunDetail` (the primary detail
+  route) checks DAG existence first and 404s as `"DAG not found"`
+  separately from a `"DAG run not found"` when the DAG exists but the run
+  doesn't — but the `/tasks` route only checks whether the **run** exists,
+  skipping the DAG-existence check entirely.
+- `conf` in the response is omitted (`null`/absent) whenever it's exactly
+  the literal empty object `"{}"` — you can't distinguish "the trigger
+  request explicitly sent `conf: {}`" from "no conf was ever set" by
+  inspecting this field.
+
+**Code snippet:**
+```
+GET /api/dags/sales_daily_report/runs/sales_daily_report_manual__2026-07-14T00%3A00%3A00Z
+-> 200
+{
+  "dag_id": "sales_daily_report",
+  "run_id": "sales_daily_report_manual__2026-07-14T00:00:00Z",
+  "run_type": "manual",
+  "state": "running",
+  "execution_date": "2026-07-14T00:00:00Z",
+  "start_time": "2026-07-14T00:00:01Z",
+  "end_time": null,
+  "duration_seconds": 381
+}
+
+GET /api/dags/sales_daily_report/runs/sales_daily_report_manual__2026-07-14T00%3A00%3A00Z/tasks
+-> 200
+[
+  {"task_id": "build_report", "operator": "PythonOperator", "state": "success",
+   "try_number": 1, "start_time": "...", "end_time": "..."},
+  {"task_id": "email_report", "operator": "EmailOperator", "state": "up_for_retry",
+   "try_number": 2, "start_time": "...", "end_time": null}
+]
+```
+
+---
+
+## Category: Config resources
+
+### 73. Connections
+
+**Description:** `/api/connections` CRUD + `/api/connections/test` (validate
+and probe without saving) + `/api/connections/export|import` (bulk JSON,
+admin-gated) — backed by a `Registry` of exactly **10** `Connector`
+implementations (snowflake, databricks, mysql, postgres, redshift, s3, gcs,
+bigquery, slack, ssh — matching doc 04's list; still no PagerDuty
+connector, per feature 45). Each connector supplies `Meta()` (dynamic form
+fields for the UI), `Validate`, `Normalize`, a real `TestConnection` probe,
+and `SecretFields()` (which `extra` JSONB keys get AES-256-GCM encrypted
+alongside the main `password` column).
+
+**Edge cases:**
+- **Verified, critical bug: editing a connection through a form pre-filled
+  from a fetched masked password silently corrupts it.**
+  `GetConnectionByID`/`GetAllConnections` always return
+  `password: "********"` (a fixed literal placeholder). `UpdateConnection`
+  has zero special-case for that placeholder — it only skips re-encrypting
+  a value that already carries the `enc:v1:` prefix. Submitting an edit
+  where the password field still literally contains `"********"` (i.e. a
+  UI round-tripped the masked GET response back into the update PUT
+  without the user retyping the secret) gets AES-encrypted **as the new
+  real password**, permanently overwriting the actual credential with the
+  8-character string `"********"`. Always re-enter the real secret when
+  editing rather than resubmitting whatever a GET returned.
+- **`TestConnection` never reads a saved connection by ID — it only
+  validates whatever raw body you POST.** There's no "test the connection I
+  already saved" by `connection_id`; the full request (including a real,
+  unmasked password) must be resent every time you click Test, even for an
+  already-existing connection.
+- `Extra` secret fields (e.g. a nested API token) are only encrypted for
+  the specific keys each connector declares via `SecretFields()` — an
+  ad-hoc key you add to `extra` yourself that isn't in that list is stored
+  and returned in **plaintext**, even sitting right next to genuinely
+  encrypted sibling keys in the same JSONB blob.
+- `GET /api/connections/export` requires the **Admin** role specifically
+  (checked via a dedicated `IsAdmin` helper), independent of the normal
+  RBAC permission system used everywhere else in this API — a custom role
+  granted `connection:view` via `piflow_permission` but not literally
+  `Admin` still gets `403` from export, even though it can read
+  connections individually via `GET /api/connections/:id`.
+- `mask_passwords` on export (default `true`) only blanks the top-level
+  `password` field — it has no effect on `extra`'s secret fields, which are
+  always masked separately and unconditionally by a different code path;
+  the two masking mechanisms don't share a toggle.
+- Bulk `import` (`mode=skip|overwrite|fail`, default `skip`) processes the
+  array **sequentially, per-item**, collecting failures into an `errors`
+  array rather than failing the whole batch atomically — a malformed
+  connection #3 of 10 doesn't roll back #1–2 that already succeeded; check
+  the response's `created`/`updated`/`skipped`/`errors` counts, don't
+  assume all-or-nothing.
+
+**Code snippet:**
+```
+GET /api/connections/types
+-> 200 [{"type": "snowflake", "label": "Snowflake", "fields": [...]}, ...]  # exactly 10 types
+
+POST /api/connections
+{"connection_id": "snowflake_prod", "connection_type": "snowflake",
+ "username": "svc_user", "password": "real-secret-value",
+ "extra": {"account": "xy12345", "warehouse": "COMPUTE_WH"}}
+# -> 201, password stored AES-256-GCM encrypted
+
+POST /api/connections/test
+{"connection_id": "snowflake_prod", "connection_type": "snowflake",
+ "username": "svc_user", "password": "real-secret-value", "extra": {"account": "xy12345"}}
+# -> 200 {"status": "success", "message": "Connection successful"}  (a real live probe)
+
+# DANGER (verified): re-saving a fetched connection without retyping the password
+GET /api/connections/snowflake_prod   -> {"password": "********", ...}
+PUT /api/connections/snowflake_prod   {"password": "********", ...}  # <-- corrupts the real secret
+```
+
+---
+
+### 74. Variables
+
+**Description:** `/api/variables` CRUD, backed by the flat `variable` table
+(key → string value, `is_encrypted` flag). Keys must match
+`^[a-zA-Z][a-zA-Z0-9_.\-]{0,254}$`. When `is_encrypted=true`,
+create/update AES-encrypt the value before writing it, and the single-key
+GET transparently decrypts it back on read.
+
+**Edge cases:**
+- **The list view masks encrypted values as `"***"`, but the single-key GET
+  does not mask at all — it returns the real, decrypted plaintext.**
+  `GET /api/variables` shows `"***"` for any `is_encrypted=true` row;
+  `GET /api/variables/:key` for that same row returns the actual secret in
+  the clear to anyone with view permission. Encryption here (like the
+  DAG-runtime Variables in feature 41) only protects the value at rest in
+  Postgres and in the list view — not from any caller who can hit the
+  single-key endpoint.
+- **Same structural risk as the Connections bug (feature 73) is present in
+  the code, though not confirmed against any specific frontend:** `Update`
+  has no special-casing for a placeholder value either — if a client
+  pre-fills an edit form from the masked `"***"` list view (rather than a
+  fresh single-key GET) and saves without changing the value, `"***"`
+  itself gets encrypted and stored as the new "real" value, silently
+  destroying the original secret. Always fetch via the single-key endpoint
+  (which returns the true value) before editing an encrypted variable,
+  never from the list.
+- **`is_encrypted` is just another field in the update payload, not a
+  one-way flag** — flipping it `true→false` on update stores the (already
+  decrypted-by-then, since the request must supply the real value)
+  plaintext going forward; flipping `false→true` encrypts whatever
+  plaintext you send. There's no server-side guard against accidentally
+  toggling this.
+- Key format validation only runs on **create** — update/delete operate on
+  whatever `key` is already in the path param and never re-validate the
+  pattern (moot in practice, since an invalid key couldn't have been
+  created in the first place).
+- **The worker's own internal variable loader silently skips any row whose
+  decryption fails**, rather than failing the whole variable-load for every
+  task — a corrupted encrypted value (e.g. from the placeholder-overwrite
+  risk above, once the AES key or ciphertext no longer matches) just
+  vanishes from every task's `{{ .Var.x }}`/`var.value.x` context with no
+  error surfaced anywhere.
+
+**Code snippet:**
+```
+POST /api/variables
+{"key": "extract_api_key", "value": "sk-real-secret", "is_encrypted": true}
+# -> 201 {"message": "variable created", "key": "extract_api_key"}
+
+GET /api/variables                  -> [{"key": "extract_api_key", "value": "***", "is_encrypted": true}]
+GET /api/variables/extract_api_key  -> {"key": "extract_api_key", "value": "sk-real-secret", "is_encrypted": true}
+#                                       ^ real plaintext returned here — no masking on single-key GET
+```
+
+---
+
+### 75. Pools
+
+**Description:** Per doc 06/08, `metadata.pool` (`pool_id` PK, `slots`,
+`description`) is the concurrency-pool table a task's `pool=` param
+(feature 18) draws from, and the RBAC seed matrix even grants
+`pool:view`/`pool:edit` permissions to the Admin/Op/Editor roles.
+
+**Edge cases:**
+- **Verified: there is no REST API for Pools at all.** An exhaustive
+  search of the entire webserver package (handlers, services,
+  repositories, routes) turns up zero pool-related endpoints — the only
+  code that reads `metadata.pool` is the scheduler-side
+  `pool_repository.go`'s `GetAllPools()`, called exclusively at dispatch
+  time to enforce slot limits (doc 02/03). The `pool:view`/`pool:edit` RBAC
+  permissions are seeded and ready, but there is nothing behind them to
+  authorize — "View/edit concurrency slots" (doc 07/08) has no UI or API
+  surface to exercise today.
+- **Practical consequence for feature 18:** creating a pool with a real
+  slot cap (rather than the effectively-unlimited fallback that applies
+  when a `pool=` name has no matching row) requires inserting directly
+  into `metadata.pool` via a SQL client against the Postgres sidecar —
+  there is no `POST /api/pools`-style call to do it through the product.
+- Only the seeded `default` pool (128 slots) exists out of the box
+  (`pi_schema.sql`'s idempotent seed) — any other pool name referenced
+  from a DAG file exists only as a string on the `task` row until someone
+  manually inserts a corresponding `metadata.pool` row.
+- Because enforcement is scheduler-side only (a SQL subquery against
+  `metadata.pool.slots` at dispatch time), even a manually-inserted pool
+  row takes effect on the **very next scheduler iteration** — no restart
+  or cache invalidation needed, once you have a way to create the row.
+
+**Code snippet:**
+```
+-- No REST endpoint exists — the only way to create a real pool cap today
+-- is a direct SQL statement against the Postgres sidecar:
+INSERT INTO metadata.pool (pool_id, slots, description)
+VALUES ('etl_heavy', 10, 'Heavy ETL tasks - capped at 10 concurrent')
+ON CONFLICT (pool_id) DO UPDATE SET slots = EXCLUDED.slots;
+
+-- Referencing it from a DAG file (feature 18) works as soon as the row exists:
+heavy_task = PythonOperator(task_id="heavy_transform", python_callable=lambda: None, pool="etl_heavy")
+```
+
+---
+
+### 76. Event listeners
+
+**Description:** `/api/event-listeners` CRUD (admin-only, `system/admin`
+RBAC) registers webhook subscriptions on the in-process event bus for
+lifecycle events (`GET /api/events/types` enumerates all 15 — task state
+changes, DAG run created, SLA miss, dataset triggered, backpressure,
+callback fired, etc.). `GET /api/events/recent` serves a ring-buffer of
+recently published events for debugging, filterable by `dag_id`/`type`.
+
+**Edge cases:**
+- **Verified, significant bug: deleting a listener never unsubscribes it
+  from the live event bus.** `DeleteListener` only removes the DB row —
+  the event bus has no `Unsubscribe` method at all, and nothing in the
+  delete path removes the in-memory webhook subscription that was
+  registered when the listener was created (or loaded at boot). A
+  "deleted" listener keeps firing its webhook for every matching event
+  until the process restarts, even though it no longer appears in
+  `GET /api/event-listeners`.
+- **Verified, compounding bug: updating a listener re-subscribes instead of
+  replacing.** `UpdateListener` re-registers a fresh webhook subscription
+  with the new config but never removes the old one first (same missing-
+  unsubscribe root cause) — after editing a listener once, the same event
+  fires the webhook **twice** (old config and new config both still live);
+  editing it N times compounds to N+1 deliveries per event, all within the
+  same running process's lifetime.
+- **Both bugs are process-lifetime, not persistent.** A full restart
+  re-bootstraps subscriptions cleanly from scratch (only `enabled=true,
+  listener_type='webhook'` rows are loaded fresh at boot), so the
+  duplicate/zombie-listener state resets on redeploy but silently
+  accumulates between deploys as listeners are edited/deleted through the
+  UI in the meantime.
+- **`listener_type` isn't validated against a fixed set at all.** Only the
+  literal string `"webhook"` is ever actually wired to the event bus; any
+  other value (a typo, or a placeholder for a not-yet-implemented type) is
+  accepted and persisted without error, but silently never fires anything.
+- `event_types` is stored and used for filtering but isn't cross-checked
+  against the known event-type list either — a typo'd event type string is
+  accepted at creation time and will simply never match any real published
+  event, with no validation error to catch the mistake.
+- `GET /api/events/recent`'s `limit` silently clamps to `100` for any value
+  `<=0` or `>500` (including non-numeric strings, which parse to `0`) —
+  passing `limit=99999` or `limit=abc` both quietly return the default
+  100, not an error or the max 500.
+
+**Code snippet:**
+```
+POST /api/event-listeners
+{"name": "sla_alerts", "event_types": ["sla_miss"], "listener_type": "webhook",
+ "config": {"url": "https://ops.company.com/hooks/piflow-sla", "headers": {}}}
+# -> 201, immediately subscribed to the live event bus
+
+# Editing it once already double-fires (verified bug):
+PUT /api/event-listeners/1
+{"name": "sla_alerts", "event_types": ["sla_miss"],
+ "config": {"url": "https://ops.company.com/hooks/piflow-sla-v2"}}
+# -> 200, but BOTH the old and new webhook URLs now receive every sla_miss
+#    event until the server process restarts
+
+DELETE /api/event-listeners/1
+# -> 200 {"deleted": true} — but the in-memory subscription(s) keep firing regardless
+```
+
+---
+
+### 77. Environments
+
+**Description:** `POST /api/admin/envs` (`{"requirements": [...]}`)
+submits an async, admin-only build of a managed Python virtualenv for
+`PythonVirtualenvOperator` (feature 22) — `GET /api/admin/env-builds/:id`
+polls build state (`pending`→`building`→`ready`/`failed`);
+`GET /api/admin/envs` / `GET /api/admin/envs/:name` list/describe
+already-built envs from the read-only stage mount;
+`DELETE /api/admin/envs/:name` removes one.
+
+**Edge cases:**
+- **The env name is fully deterministic, not chosen by the caller.** It's
+  `auto_<first-16-hex-of-sha256>` of the requirements list after
+  trim/blank-line/comment stripping and **sorting** — the same set of
+  packages in any order, or with extra blank lines/comments, always
+  derives the identical name, matching the Python SDK's own env-naming
+  logic (verified against a shared test vector) so a DAG's
+  `requirements=[...]` (feature 22) and an admin's manual build request
+  agree on the name without either side communicating it explicitly.
+- **Submitting an identical requirements set while a build is already
+  `pending`/`building`/`ready` returns that SAME build object idempotently**
+  — it does not start a second build or error; only once the prior build
+  for that exact name ended `failed` (or was deleted) does resubmitting
+  start a fresh one.
+- **Verified: only ONE environment build runs at a time, system-wide,
+  regardless of how many distinct requirement sets are submitted
+  concurrently.** The build step is guarded by a single package-level
+  mutex, not one per env name — submitting builds for `pandas` and,
+  separately, `numpy` back-to-back serializes the second fully behind the
+  first's complete `venv` + `pip install` + stage-copy cycle, even though
+  they share nothing.
+- **Installs are wheelhouse-only, never live PyPI** (`pip install
+  --no-index --find-links <wheelhouse> ...`, doc 05) — a requirement not
+  already staged in the wheelhouse fails the build with pip's own "no
+  matching distribution" error; there's no fallback to the internet even
+  though the app service otherwise has egress.
+- **`jinja2` and `markupsafe` are force-appended to every build's pip
+  install command**, regardless of whether the DAG author's
+  `requirements=[...]` mentions them — needed because Python-operator
+  template rendering (feature 40) depends on Jinja2 being present in
+  whatever interpreter runs the task; if your own requirements pin a
+  conflicting `jinja2` version, both constraints go into the same
+  `pip install` call and pip's normal resolver behavior (not anything
+  PI-Flow controls) decides what actually lands.
+- **Verified (explicit code comment): `DeleteEnv` only removes the
+  writable-stage copy — it does not evict any worker's already-materialized
+  local cache.** Per doc 03's venv-resolver behavior, a worker that already
+  pulled this env down keeps using its local content-hash-keyed copy
+  "until that worker recycles" — deleting an in-use env doesn't break
+  already-warm workers immediately, but any worker that hasn't cached it
+  yet (or a freshly scaled-out instance) fails to resolve it right away.
+  There is also no "is this env currently referenced by any DAG" check
+  before deletion.
+- **Build status deliberately lives at a separate path,
+  `/api/admin/env-builds/:id`, rather than `/api/admin/envs/:id`** — a
+  code comment notes this specifically avoids a Gin routing conflict
+  between the static build-status lookup and the wildcard
+  `/envs/:name` describe/delete route; don't guess the URL by analogy with
+  the other resource's `:id`-style routes.
+
+**Code snippet:**
+```
+POST /api/admin/envs
+{"requirements": ["pandas==2.2.0", "requests==2.31.0"]}
+# -> 202 {"build_id": "bld_...", "name": "auto_<16hex>", "state": "pending"}
+
+GET /api/admin/env-builds/bld_...
+# -> 200 {"build_id": "...", "name": "auto_...", "state": "ready", "content_hash": "..."}
+
+GET /api/admin/envs
+# -> 200 {"envs": [{"name": "auto_...", "python_version": "3.12.x", ...}], "count": 1}
+
+DELETE /api/admin/envs/auto_...
+# removes the stage copy only — warm workers keep using their locally cached copy
+```
+
+---
+
+## Category: Access & account
+
+### 78. Login/session
+
+**Description:** `/api/auth/login` (session cookie + JWT pair),
+`/api/auth/token` (JWT-only, no cookie), `/api/auth/logout`,
+`/api/auth/refresh`, `/api/auth/me`, and `/api/auth/password` (change own
+password) make up the self-service auth surface. A single `Login` call
+establishes **two independent, differently-lived credentials at once**: an
+HttpOnly session cookie (DB-tracked, revocable) and a JWT access+refresh
+pair (stateless, never persisted anywhere server-side).
+
+**Edge cases:**
+- **Verified: logging out only revokes the session-cookie path — any JWTs
+  issued by that same login call keep working until they naturally
+  expire.** `Logout` deletes the session row and clears the cookie, but
+  JWTs are never tracked in any table (no blacklist/revocation list) — an
+  access token (15 min default) or refresh token (7 days default) grabbed
+  from a login response before logging out remains fully valid for the
+  rest of its natural lifetime, Bearer-header auth included, even after
+  "logging out."
+- **Verified: `/api/auth/refresh` doesn't invalidate the refresh token it
+  was just given.** It mints a brand-new access+refresh pair from a
+  presented refresh token, but the old one isn't blacklisted anywhere —
+  both the old and the newly-issued refresh token remain independently
+  valid (each until its own expiry), not rotate-and-invalidate.
+- **Role changes lag behind already-issued tokens.** `Refresh`/`Login`
+  always fetch fresh role names at mint time, so a freshly-minted token
+  reflects a user's *current* roles — but a token minted **before** a role
+  change keeps its old roles baked into its claims and stays valid under
+  them for up to its full 15-minute life. Only the session-cookie path
+  re-checks `is_active` live on every request; the JWT path has no
+  per-request revalidation at all.
+- **`/api/auth/token` and `/api/auth/refresh` have none of `/api/auth/login`'s
+  audit logging.** `Login` calls the audit logger on both success and
+  `login_failed`; `TokenLogin` and `Refresh` call it on neither —
+  JWT-only logins and every token refresh leave no trace in `audit_log`,
+  only cookie-based UI logins do.
+- **`ChangePassword` doesn't revoke anything else either.** Changing your
+  own password re-hashes and stores it, but does not delete your other
+  active sessions or invalidate any already-issued JWTs — a stolen
+  session/token from before the password change keeps working exactly as
+  before until it separately expires or is manually revoked (feature 80).
+
+**Code snippet:**
+```
+POST /api/auth/login
+{"username": "alice", "password": "correct-horse-battery-staple"}
+# -> 200 {"access_token": "...", "refresh_token": "...", "expires_at": "...",
+#         "user": {...}, "roles": ["Editor"], "force_password_change": false}
+# Also sets an HttpOnly session cookie — TWO independent credentials from one call
+
+GET /api/auth/me        (Authorization: Bearer <access_token>, OR the session cookie)
+-> 200 {"user": {...}, "roles": [...], "permissions": [...]}
+
+POST /api/auth/refresh
+{"refresh_token": "<old_refresh_token>"}
+# -> 200 new access_token + refresh_token
+# NOTE: the OLD refresh_token you just sent is still valid too — not rotated out
+
+POST /api/auth/logout
+# -> 200 {"message": "logged out"} — kills the session cookie/row ONLY;
+#    any JWTs from the same login keep working until they expire naturally
+```
+
+---
+
+### 79. API keys
+
+**Description:** `/api/auth/api-keys` — Create/List/Revoke long-lived
+personal API keys (`X-API-Key` header auth, doc 04). A key is generated as
+`pf_<64 hex chars>`, shown once in the Create response, and stored only as
+a SHA-256 hash plus a display `key_prefix` (`pf_xxxxxxxx...`) — the
+plaintext is never recoverable after creation.
+
+**Edge cases:**
+- **The plaintext key is shown exactly once, at creation** — losing it
+  means generating a brand-new key (and separately revoking the old one if
+  it needs to be retired); there is no "show key again" or
+  reset-without-rotating endpoint.
+- **`APIKeyMaxPerUser` (default 5, doc 05) only counts currently
+  `is_active=true` keys.** Revoking a key immediately frees a slot — you
+  can create and revoke keys indefinitely as long as you never have more
+  than the max simultaneously active; revoked keys aren't deleted, just
+  flagged inactive, so lifetime key count isn't capped.
+- **Revocation is checked live on every single request, not cached** —
+  `ValidateAPIKey`'s query filters `is_active=TRUE AND u.is_active=TRUE AND
+  (expires_at IS NULL OR expires_at > NOW())` fresh each time, so
+  `DELETE /api/auth/api-keys/:id` takes effect on the very next API call
+  made with that key — unlike the JWT path (feature 78), API-key auth has
+  real, immediate revocation.
+- **An admin can revoke ANY user's key by ID, but cannot list other users'
+  keys through this API.** `RevokeKey` accepts an admin bypass on the
+  ownership check, but `ListKeys` is hard-scoped to the caller's own
+  `user_id` with no admin "list all keys" or "list this user's keys"
+  variant — an admin can only act on a key ID they already know (e.g. from
+  the audit log), not discover it by browsing.
+- **There is no rename/edit endpoint** — a key's `name` is fixed at
+  creation; renaming means revoking and creating a new key under the
+  desired name (which also means rotating the secret, since there's no way
+  to relabel without regenerating).
+- Every successful create/revoke is audit-logged (`create_api_key`/
+  `revoke_api_key`) — unlike login via `/api/auth/token` (feature 78),
+  this surface's mutations are consistently traceable in `audit_log`.
+
+**Code snippet:**
+```
+POST /api/auth/api-keys
+{"name": "ci-pipeline-key"}
+# -> 201 {"key": "pf_9f3a...<64 hex chars>...", "api_key": {"id": 7, "key_prefix": "pf_9f3a3c1e...", ...},
+#         "message": "Store this key securely — it will not be shown again"}
+
+GET /api/auth/api-keys
+# -> 200 {"api_keys": [{"id": 7, "name": "ci-pipeline-key", "key_prefix": "pf_9f3a3c1e...",
+#                        "is_active": true, "last_used_at": null, ...}]}
+# (the raw key itself is never returned again, only the masked prefix)
+
+DELETE /api/auth/api-keys/7
+# -> 200 {"message": "API key revoked"} — effective immediately on the next request using it
+```
+
+---
+
+### 80. Sessions
+
+**Description:** `/api/admin/sessions` (list all active browser sessions,
+admin-only) + `/api/admin/sessions/:id` (force-terminate one) +
+`/api/admin/users/:id/sessions` (terminate ALL sessions for a user) — the
+admin-facing counterpart to the per-user session created at login
+(feature 78).
+
+**Edge cases:**
+- **"Instant revocation" is real here, structurally, unlike JWTs.**
+  `ValidateSession` is a live `SELECT ... WHERE s.id=$1 AND s.expires_at >
+  NOW() AND u.is_active=TRUE` executed on every request authenticated via
+  the session cookie — there's no in-memory session cache to invalidate.
+  Terminating a session (or a user's `is_active` flag flipping to false)
+  takes effect on that user's **very next request**, not after some cache
+  TTL.
+- **This only ever touches session-cookie auth — it has zero effect on
+  that same user's JWTs or API keys.** Terminating every session for a
+  user does not revoke any access/refresh token they're also holding
+  (feature 78) nor any API key (feature 79) — a user logged in via a
+  mobile client using only a Bearer token continues working uninterrupted
+  even after an admin "terminates all their sessions" from the UI, which
+  can give a false sense of having fully locked someone out.
+- **`ListActiveSessions` only ever shows non-expired rows**
+  (`WHERE expires_at > NOW()`) — an admin reviewing "who's logged in"
+  never sees a session that's already timed out, even if it was active
+  moments ago; there's no historical view of past sessions here (that's
+  what `audit_log`'s `login`/`logout` entries are for, separately).
+- **No record of *why* a session was terminated is kept on the session
+  side** — `TerminateSession`/`TerminateUserSessions` just `DELETE` the
+  row(s) outright; any audit trail of an admin forcibly logging someone
+  out has to come from `audit_log` (if that admin action is itself
+  logged elsewhere), not from anything the session table retains.
+- Sessions carry `ip_address`/`user_agent` captured **at login time only**
+  — if a session is later reused from a different network/browser, neither
+  field updates to reflect that; only `last_active_at` moves (touched on
+  each authenticated request), so the admin list can't distinguish "same
+  browser, different location" without cross-referencing IP history
+  elsewhere.
+
+**Code snippet:**
+```
+GET /api/admin/sessions
+# -> 200 {"sessions": [{"id": "a1b2...", "user_id": 3, "username": "alice",
+#                        "ip_address": "10.0.0.5", "user_agent": "Mozilla/5.0...",
+#                        "expires_at": "...", "last_active_at": "..."}]}
+
+DELETE /api/admin/sessions/a1b2c3...
+# -> 200 {"message": "session terminated"} — effective on alice's very next request
+
+DELETE /api/admin/users/3/sessions
+# -> 200 {"message": "all sessions terminated for user"}
+# NOTE: alice's JWTs and API keys (features 78/79) are UNAFFECTED by this call
+```
+
+---
+
+### 81. RBAC (admin)
+
+**Description:** `/api/admin/users`, `/api/admin/roles`,
+`/api/admin/roles/:id/permissions`, and `/api/dags/:dag_id/permissions`
+provide full user/role/permission/per-DAG-ACL management. The 5 seeded
+roles (Admin/Op/Editor/Viewer/Public, doc 06) are structurally protected
+from modification; only custom roles (created via `POST /api/admin/roles`)
+can have their permissions edited.
+
+**Edge cases:**
+- **The 5 seeded roles are fully immutable through this API — name,
+  description, permissions, and existence.** `UpdateRole`, `DeleteRole`,
+  and `SetRolePermissions` each independently check for a default role and
+  reject with `403` if so. There's no way to, say, add one extra
+  permission to the built-in `Viewer` role directly — you'd need to create
+  a new custom role with `Viewer`'s permissions plus the extra one, and
+  assign that instead.
+- **Verified, real TOCTOU race: "last admin" protection is read-then-write,
+  not transactional.** Disabling a user (`is_active=false`), deleting a
+  user, and removing the `Admin` role via role reassignment each
+  independently count users with the `Admin` role and only reject if that
+  count is `<= 1` *before* proceeding — there's no locking between the
+  check and the mutation. Two concurrent requests each demoting a
+  **different** one of exactly two remaining admins can both read
+  `adminCount=2`, both pass the check, and both succeed — leaving zero
+  admins, the exact outcome each individual request believed it was
+  preventing.
+- **`PUT /api/admin/users/:id/roles` fully replaces a user's role set — it's
+  not additive.** Submitting a `role_ids` array that omits a role the user
+  currently has silently removes it; there's no separate "grant one more
+  role" call, only wholesale replace.
+- **Verified, significant bug: `GET /api/dags/{dag_id}/permissions`
+  hardcodes every entry's `source` field to the literal string `"admin"`,
+  regardless of the row's actual `source` column.** The underlying query
+  doesn't even select `dp.source`, and the handler's flattening logic
+  writes `"source": "admin"` unconditionally for every permission it
+  emits. A permission actually synced from a DAG file's `access_control=`
+  (feature 10, `source='dag_file'`) is indistinguishable from an
+  admin-set one in this view — an operator editing per-DAG permissions
+  through this endpoint has no way to tell, from the API response, that a
+  grant they're about to toggle will simply be overwritten again on the
+  next Git ingestion pass. (The underlying write path is unaffected by
+  this — the real `source` column is preserved correctly on disk; it's
+  only this read endpoint that's lossy.)
+- **`POST`/`DELETE /api/dags/{dag_id}/permissions` toggle exactly ONE
+  action per call via a read-then-flip-then-upsert cycle** — granting a
+  role `view`+`trigger`+`edit` on a DAG takes three separate sequential
+  API calls, not one batch call with an actions array.
+- **The permission row is deleted entirely once all five boolean columns
+  are false**, rather than left as an all-`false` row — functionally
+  equivalent for permission checks, but means re-querying immediately
+  after removing a role's last permission on a DAG returns no row for that
+  role at all, not a row with everything `false`.
+
+**Code snippet:**
+```
+POST /api/admin/roles
+{"name": "DataEngineer", "description": "Custom role for the data platform team"}
+# -> 201 (a NEW custom role — editable/deletable, unlike the 5 seeded roles)
+
+PUT /api/admin/roles/12/permissions
+{"permissions": [{"resource_type": "dag", "resource_id": "*", "action": "trigger"},
+                  {"resource_type": "connection", "resource_id": "*", "action": "view"}]}
+# -> 200 {"message": "permissions updated"}  (would 403 if role 12 were e.g. "Editor")
+
+PUT /api/admin/users/5/roles
+{"role_ids": [12]}
+# -> 200 — REPLACES all of user 5's roles with just role 12, not additive
+
+POST /api/dags/finance_close/permissions
+{"role_name": "Op", "action": "trigger"}
+# -> 200 {"role_name": "Op", "action": "trigger", "source": "admin"}
+# NOTE (verified): "source" is ALWAYS "admin" in every response from this endpoint,
+# even for a permission actually synced from the DAG file's access_control= (feature 10)
+```
