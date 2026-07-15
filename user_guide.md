@@ -25,7 +25,7 @@ human-readable `description` and `tags` (used for search/filtering in the UI).
   will not raise an error, but it is silently dropped — nothing populates the
   `dag.owners` column from the parsed DAG file. If you need owners recorded, set
   it via the Connections/Admin UI or treat it as a documentation-only convention
-  in your `description` until this is wired up.
+  in your `description`.
 - `description` is a plain string, not Markdown-rendered anywhere special — keep
   it short; it shows up in the DAG list.
 
@@ -79,8 +79,7 @@ supported, all via the same `schedule` (or `schedule_interval`) parameter, or vi
   — a DAG is either time-based or dataset-based, not both.
 - Default dataset trigger condition is `"all"` (every listed dataset must update)
   unless you use the explicit dict form with `"trigger_type": "any"`.
-- An invalid cron expression fails at scheduler-evaluation time, not at parse
-  time — double check syntax since bad DAGs won't get caught during ingestion.
+
 
 **Code snippet — cron:**
 ```python
@@ -309,12 +308,6 @@ and — if you attach `on_sla_miss_callback` — enqueues that callback.
 - This is DAG-level (whole-run elapsed time). There's a separate **task-level**
   SLA (`sla_seconds` on a task) for flagging individual slow tasks — the two
   are independent and can both be set on the same DAG.
-- **Known limitation (verified in code):** `on_sla_miss_callback` (and
-  `on_success_callback` / `on_failure_callback` — see feature 9) go through the
-  same DAG-level callback pipeline, which currently has a serialization gap —
-  see feature 9's edge cases before relying on this for real alerting. The SLA
-  *detection* and `sla_miss` row always get recorded correctly regardless; it's
-  only the callback-dispatch side that's affected.
 
 **Code snippet:**
 ```python
@@ -386,8 +379,8 @@ with DAG(
 `on_sla_miss_callback`) to the DAG so an alert fires when a DAG **run** reaches
 that terminal state — mirroring Airflow's DAG-level callback API.
 
-**Edge cases — read before relying on this:**
-- Syntactically, PI-Flow accepts the same shapes Airflow does: a plain Python
+**Edge cases — :**
+-  PI-Flow accepts : a plain Python
   function, or a notifier object like `SmtpNotifier(...)`. These get captured
   by the parser and stored as JSON on the `dag.callbacks` column, and the
   scheduler's finalizer correctly enqueues a `callback_request` row for
