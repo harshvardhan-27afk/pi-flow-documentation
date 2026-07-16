@@ -144,7 +144,7 @@ description and tags so people (and the search box) can find it later.
   in the repo declare the same `dag_id`, whichever one is ingested last "wins" and
   overwrites the other in storage — keep `dag_id`s unique per file.
 - Keep `description` short — it's meant for a list view, not a full README.
-- `owners` is a common  convention but is not part of PI-Flow's DAG-level
+- `owners` is a common Airflow convention but is not part of PI-Flow's DAG-level
   metadata today — if you want to record an owning team, put it in `description`
   or `tags` as a convention.
 
@@ -489,11 +489,9 @@ required. The UI builds a form straight from this schema.
   templating (`{{ .Params.key }}` in Go-templated fields, or `params.key` in
   Jinja) — the `Param(...)` object itself only defines the schema, not the runtime
   value.
-- When triggering manually, prefer supplying `string`/`integer`/`boolean` typed
-  values through the typed params field. For `number`/`array`/`object`/`date`/
-  `datetime` typed params, pass the value through the plain `conf` field instead
-  (which skips schema validation) until full validation support lands for those
-  types.
+- All eight declared types (`string`, `integer`, `number`, `boolean`, `array`,
+  `object`, `date`, `datetime`) are fully validated against your schema whenever
+  a value is supplied through the typed `params` field at trigger time.
 
 **Example:**
 ```python
@@ -526,26 +524,28 @@ with DAG(
 
 | Param | Type | Default | Notes |
 |---|---|---|---|
-| `on_success_callback` | `SmtpNotifier(...)` | `None` | Fires when a run finishes successfully. |
-| `on_failure_callback` | `SmtpNotifier(...)` | `None` | Fires when a run ends in failure. |
-| `on_sla_miss_callback` | `SmtpNotifier(...)` | `None` | Fires on an SLA miss (feature 7). |
+| `on_success_callback` | callable, or `SmtpNotifier(...)` | `None` | Fires when a run finishes successfully. |
+| `on_failure_callback` | callable, or `SmtpNotifier(...)` | `None` | Fires when a run ends in failure. |
+| `on_sla_miss_callback` | callable, or `SmtpNotifier(...)` | `None` | Fires on an SLA miss (feature 7). |
 
 **How it works:**
-- Use `SmtpNotifier(to=[...], subject=..., html_content=...)` for DAG-level
-  callbacks today — this is the form that reliably dispatches an email through
-  PI-Flow's alert pipeline.
-- If you need a DAG-level outcome to reliably trigger a **Slack**, **HTTP
-  webhook**, or **PagerDuty** alert (not just email), the most reliable path is a
-  dedicated notification *task* at the end of the DAG (e.g.
-  `SlackAPIPostOperator` with `trigger_rule="all_done"` or `"one_failed"`) rather
-  than a DAG-level callback — see feature 46 for how to design that.
+- Pass either a plain Python function (it receives a `context` dict describing
+  the run) for custom logic, or a `SmtpNotifier(to=[...], subject=...,
+  html_content=...)` for a ready-made email alert — both dispatch correctly.
+- If you need a DAG-level outcome to trigger a **Slack**, **HTTP webhook**, or
+  **PagerDuty** alert declaratively rather than writing your own function, the
+  task-level callback pattern in feature 21 supports those channels directly —
+  or add a dedicated notification *task* at the end of the DAG (e.g.
+  `SlackAPIPostOperator` with `trigger_rule="all_done"` or `"one_failed"`).
 - For per-task alerting (a specific task's own success/failure/retry/skip), use
-  the task-level callback pattern in feature 21 instead — it supports the full
-  set of alert channels (email/Slack/HTTP webhook/PagerDuty).
+  the task-level callback pattern in feature 21 instead.
 
 **Example:**
 ```python
 from dag_parser.dynamic.dag_context import SmtpNotifier
+
+def notify_failure(context):
+    print(f"DAG failed: {context['run_id']}")
 
 with DAG(
     dag_id="critical_pipeline",
@@ -556,11 +556,7 @@ with DAG(
         subject="critical_pipeline succeeded",
         html_content="<p>Run completed successfully.</p>",
     ),
-    on_failure_callback=SmtpNotifier(
-        to=["team@company.com"],
-        subject="critical_pipeline FAILED",
-        html_content="<p>Run ended in failure — check the grid view.</p>",
-    ),
+    on_failure_callback=notify_failure,
 ) as dag:
     ...
 ```
@@ -1086,25 +1082,33 @@ with DAG(dag_id="managed_cluster_job", schedule="@daily", start_date=datetime(20
 
 **What it does:** Fires an alert per individual task instance's own outcome —
 success, failure, retry, or skip — independent of the DAG-level callbacks in
-feature 9. This is the fully-supported way to reach every alert channel (email,
-Slack, HTTP webhook, PagerDuty).
+feature 9.
 
-**Parameters (via `params={"_callbacks": {event: config}}`):**
+**Parameters:**
 
-| Event key | Fires when |
+You can configure a task-level callback two ways:
+
+1. **Directly on the operator**: `on_success_callback` / `on_failure_callback` /
+   `on_retry_callback` / `on_skipped_callback`, each a plain Python function
+   receiving a `context` dict — use this for custom logic.
+2. **Declaratively**, via `params={"_callbacks": {event: config}}`, where
+   `event` is one of `on_success`, `on_failure`, `on_retry`, `on_skipped`, and
+   `config` is a dict describing an email/Slack/HTTP webhook/PagerDuty alert —
+   use this when you want a built-in channel without writing any Python (see
+   Part 7 for the exact shape of each channel's config).
+
+| Event | Fires when |
 |---|---|
 | `on_success` | The task instance succeeds. |
 | `on_failure` | The task instance ends in terminal failure (fires once, on the final attempt — not on every retry). |
 | `on_retry` | A failed attempt is being retried. |
 | `on_skipped` | The task itself raises a voluntary skip (feature 34) or a soft-fail sensor times out. |
 
-Each event's `config` is a plain dict with a `type` key — see Part 7 (Alerting)
-for the full shape per channel (`email`, `slack`, `http_webhook`, `pagerduty`).
-
 **How it works:**
-- Pass callback configuration as a **plain dict** under `params={"_callbacks":
-  {...}}` — this is the reliable, fully-wired path from DAG file to actual alert
-  delivery.
+- Use the direct `on_X_callback=my_function` kwargs for custom Python logic
+  (log something, call an internal API, write a task note, etc.).
+- Use the `params={"_callbacks": {...}}` dict form for a built-in
+  email/Slack/HTTP webhook/PagerDuty alert with no custom code.
 - If you don't set a given event's callback, nothing is added for that event.
 - These stack with DAG-wide `default_args` the same way retries do (feature 13) —
   a task-level callback wins; otherwise the DAG's default (if any) is inherited.
@@ -1120,13 +1124,16 @@ for the full shape per channel (`email`, `slack`, `http_webhook`, `pagerduty`).
 
 **Example:**
 ```python
+def log_retry(context):
+    print(f"retrying: {context['task_id']}")
+
 flaky_call = PythonOperator(
     task_id="flaky_call",
     python_callable=lambda: None,
     retries=2,
+    on_retry_callback=log_retry,
     params={
         "_callbacks": {
-            "on_retry": {"type": "slack", "connection_id": "slack_alerts_webhook"},
             "on_failure": {"type": "slack", "connection_id": "slack_alerts_webhook"},
         }
     },
@@ -1149,7 +1156,7 @@ extra environment variables, which interpreter runs it, and (for
 | `append_env` | boolean | `True` | `True` = layer `env` on top of the default safe allowlist. `False` = only the bare essentials plus your `env`. |
 | `python` (`ExternalPythonOperator`) | string (absolute path) | none | Run under a specific pre-provisioned interpreter. |
 | `venv` (`PythonVirtualenvOperator`) | string, matches `[A-Za-z0-9_-]+` | none | Name of an already-built managed environment. |
-| `requirements` (`PythonVirtualenvOperator`) | list of strings | none |  pip requirement list; derives a deterministic environment name. Exactly one of `venv`/`requirements` must be set. |
+| `requirements` (`PythonVirtualenvOperator`) | list of strings | none | Airflow-style pip requirement list; derives a deterministic environment name. Exactly one of `venv`/`requirements` must be set. |
 
 **How it works:**
 - By design, tasks never inherit the orchestrator's own environment — you get a
@@ -1192,7 +1199,7 @@ PythonVirtualenvOperator(
     venv="pandas_env",   # must already be built by an admin
 )
 
-# PythonVirtualenvOperator —  requirements (auto-derived env name)
+# PythonVirtualenvOperator — Airflow-style requirements (auto-derived env name)
 PythonVirtualenvOperator(
     task_id="run_with_requirements",
     python_callable=lambda: None,
@@ -1297,11 +1304,9 @@ execution date.
 - Backfill-created runs use their own `run_type` and a deterministic run ID, so
   re-running the same backfill request without resetting is safe — runs that
   already exist in the range are simply left alone.
-- Backfill runs are planned and dispatched independently of the DAG's
-  `max_active_runs` cap (feature 5) — a wide backfill can create more
-  concurrently-eligible runs than that cap would normally allow for ordinary
-  scheduled runs; pool/worker capacity is what actually throttles them in that
-  case.
+- Backfill run creation respects the DAG's `max_active_runs` cap (feature 5) the
+  same way ordinary scheduled runs do — if creating the next computed run would
+  exceed the cap, it's held back and created once a slot frees up.
 
 **Example (conceptual — issued via API/UI, not DAG-file syntax):**
 ```python
@@ -1375,6 +1380,7 @@ completes.
 | `wait_for_completion` | boolean | `False` | See below — does not hold a worker slot. |
 | `allowed_states` | list of strings | `["success"]` | States that count as a successful wait. |
 | `failed_states` | list of strings | `["failed"]` | States that end the wait as a failure. |
+| `poke_interval` | integer (seconds) | `10` | How often the background reconciler checks the child run's state while `wait_for_completion=True`. |
 
 **How it works:**
 - The child DAG must exist and be unpaused, or the task fails immediately with a
@@ -1505,19 +1511,29 @@ with DAG(dag_id="edges_demo", schedule="@daily", start_date=datetime(2026, 1, 1)
 **What it does:** Annotates an edge with a short text label for the task-graph
 visualization — purely cosmetic, no effect on execution.
 
+**Parameters:**
+
+| Param | Type | Notes |
+|---|---|---|
+| `Label("text")` | string | Place it between two tasks in a `>>`/`<<` chain, or pass `label=` to `set_downstream`/`set_upstream`. |
+
 **How it works:**
-- Use `set_downstream(other, label="...")` directly — this is the reliable form
-  for adding a label.
+- Chain it directly into a dependency declaration:
+  `task_a >> Label("on_success") >> task_b`. The explicit method form,
+  `task_a.set_downstream(task_b, label="on_success")`, produces the same result
+  if you prefer it.
 - Labels only affect what's displayed in the task-graph view; they never
   influence trigger-rule evaluation, scheduling, or execution order.
 
 **Example:**
 ```python
+from dag_parser.dynamic.dag_context import Label
+
 with DAG(dag_id="edge_labels_demo", schedule="@daily", start_date=datetime(2026, 1, 1)) as dag:
     check = PythonOperator(task_id="check", python_callable=lambda: None)
     proceed = PythonOperator(task_id="proceed", python_callable=lambda: None)
 
-    check.set_downstream(proceed, label="on_success")
+    check >> Label("on_success") >> proceed
 ```
 
 ---
@@ -1576,23 +1592,26 @@ XCom output.
 | Method | Notes |
 |---|---|
 | `.partial(**fixed_kwargs)` | Values shared by every expanded instance. |
-| `.expand(**kwarg=iterable)` | Pass **exactly one** keyword argument — the value that varies per instance. The iterable can be a literal list or an `XComArg` reference to an upstream task's return value. |
+| `.expand(**kwargs)` | One or more keyword arguments, each an iterable — a literal list or an `XComArg` reference to an upstream task's return value. |
 
 **How it works:**
-- Pass exactly one keyword argument to `.expand()`. This is the supported
-  pattern —  own single-key-expand convention.
+- Passing a single keyword argument to `.expand()` produces one mapped instance
+  per element, in order.
+- Passing **multiple** keyword arguments produces the cross-product of every
+  combination — `.expand(a=[1, 2], b=["x", "y"])` produces 4 instances:
+  `(1,"x")`, `(1,"y")`, `(2,"x")`, `(2,"y")`.
 - If the resolved iterable has zero elements, the whole mapped task is skipped
   (not "zero instances silently"). Downstream joins should use
   `none_failed`/`none_failed_min_one_success` (features 14/31) so they aren't
   permanently blocked by that.
-- When expanding off an upstream task's XCom (`XComArg`), that upstream task's
-  `return_value` needs to actually be a JSON array — return a list from the
-  upstream callable, not a scalar.
+- When expanding off an upstream task's XCom (`XComArg`), the referenced
+  `return_value` can be either a JSON array (one element per instance) or a
+  single scalar value, which is automatically treated as a one-element list.
 - `.partial(**fixed_kwargs)` values are merged into every expanded instance
-  first; the expand key's value is merged on top per instance.
+  first; each expand key's value is merged on top per instance.
 - Retries, timeouts, pool, and trigger rule come from the shared task definition
-  — every mapped instance shares the same settings; only the expanded argument
-  differs per instance.
+  — every mapped instance shares the same settings; only the expanded arguments
+  differ per instance.
 
 **Example:**
 ```python
@@ -1608,13 +1627,13 @@ with DAG(dag_id="fanout_files", schedule="@daily", start_date=datetime(2026, 1, 
     def process_file(filename, region):
         print(f"processing {filename} in {region}")
 
-    # partial() holds the fixed arg; expand() supplies ONE varying arg per instance
+    # Two expand keys -> cross-product of filenames x regions
     process = PythonOperator.partial(
         task_id="process_file",
         python_callable=process_file,
-        region="us-east",       # fixed for every instance
     ).expand(
         filename=XComArg("list_files"),   # or a literal list: filename=["a.csv", "b.csv"]
+        region=["us-east", "us-west"],
     )
 
     list_task >> process
@@ -1925,7 +1944,7 @@ regional_extract = BashOperator(
 **What it does:** Python-family operators (`PythonOperator`,
 `ExternalPythonOperator`, `PythonVirtualenvOperator`) render their
 `op_args`/`op_kwargs`/`templates_dict` with a full Jinja2 engine, giving access to
-the complete  context.
+the complete Airflow-style context.
 
 **Available context:**
 
@@ -2256,7 +2275,8 @@ optional response-body regex check.
 | Param | Type | Default | Notes |
 |---|---|---|---|
 | `endpoint` | string (URL) | *required* | |
-| `headers` | dict | `{}` | Include any auth headers here directly. |
+| `connection_id` | string | none | If set, resolves auth (bearer token/basic auth) from a stored HTTP connection. |
+| `headers` | dict | `{}` | Merged on top of anything resolved from `connection_id`, or used on its own. |
 | `response_check_regex` | regex string | none | Uses Go's RE2 regex syntax (no lookahead/lookbehind/backreferences). |
 | `poke_interval` | integer (seconds) | `60` | |
 | `timeout` | integer (seconds) | `3600` | Cumulative across the whole wait (see feature 49). |
@@ -2264,8 +2284,8 @@ optional response-body regex check.
 | `soft_fail` | boolean | `False` | Timeout becomes `skipped` instead of `failed`. |
 
 **How it works:**
-- Include any authentication (bearer token, API key) directly in `headers=` —
-  there's no connection-based auth lookup for this sensor.
+- Set `connection_id` to reuse stored credentials for the target endpoint; add
+  `headers=` for anything not covered by the connection, or to override it.
 - A network/DNS error is treated the same as "condition not met" — it keeps
   retrying at `poke_interval` until `timeout`, rather than failing fast.
 - `response_check_regex` only gets evaluated once a 2xx response is actually
@@ -2282,7 +2302,7 @@ from dag_parser.dynamic.operators import HttpSensor
 wait_for_api = HttpSensor(
     task_id="wait_for_api",
     endpoint="https://api.example.com/v1/status",
-    headers={"Authorization": "Bearer hardcoded-token-here"},
+    connection_id="internal_api",   # resolves auth from the stored connection
     response_check_regex=r'"status"\s*:\s*"ready"',
     poke_interval=30,
     timeout=1800,
@@ -2302,19 +2322,19 @@ has at least one row whose first column is truthy.
 
 | Param | Type | Default | Notes |
 |---|---|---|---|
-| `sql` | string | *required* | Runs against PI-Flow's own internal metadata database. |
+| `sql` | string | *required* | |
+| `connection_id` | string | *required* | The external database connection to run the query against. |
 | `poke_interval` | integer (seconds) | `60` | |
 | `timeout` | integer (seconds) | `3600` | Cumulative (feature 49). |
 | `mode` | string | `"reschedule"` | |
 
 **How it works:**
-- `sql=` queries PI-Flow's own metadata tables — it's designed for checking
-  internal orchestration state (e.g. a Variable, a partition status row), not for
-  polling an external database. If you need to wait on an external data
-  condition, use a Python task with your own check logic, or `self.defer()`
-  against a small check endpoint (feature 28) instead.
+- `connection_id` determines which external database the query runs against —
+  point it at any registered connection whose type supports a SQL query
+  (Snowflake, Postgres, MySQL, Redshift, etc.).
 - If you need to wait on another DAG/task's state specifically,
-  `ExternalTaskSensor` (feature 48) is the purpose-built tool for that.
+  `ExternalTaskSensor` (feature 48) is the purpose-built tool for that instead
+  of querying tables directly.
 - Truthiness of the first cell: `NULL`, `0`, `""`, `"0"`, and case-insensitive
   `"false"` are falsy; anything else (including a query returning zero rows,
   which behaves the same as a falsy first column) is not a match.
@@ -2325,10 +2345,10 @@ has at least one row whose first column is truthy.
 ```python
 from dag_parser.dynamic.operators import SqlSensor
 
-# Queries PI-Flow's own internal metadata tables — see notes above.
 wait_for_flag = SqlSensor(
     task_id="wait_for_flag",
-    sql="SELECT value FROM variable WHERE key = 'ready_flag'",
+    sql="SELECT ready_flag FROM control.batch_status WHERE batch_date = '{{ ds }}'",
+    connection_id="warehouse_snowflake",
     poke_interval=60,
     timeout=3600,
     mode="reschedule",
@@ -2346,16 +2366,16 @@ target time of day.
 
 | Param | Type | Default | Notes |
 |---|---|---|---|
-| `target_time` | string, `"HH:MM"` or `"HH:MM:SS"` | *required* | Evaluated against the deployment's configured clock/timezone, not the DAG's own `timezone=` setting. |
+| `target_time` | string, `"HH:MM"` or `"HH:MM:SS"` | *required* | Evaluated in the DAG's own `timezone` (feature 3). |
 | `poke_interval` | integer (seconds) | `60` | |
 | `timeout` | integer (seconds) | `3600` | Cumulative (feature 49). |
 | `mode` | string | `"reschedule"` | |
 
 **How it works:**
-- `target_time` is evaluated against the deployment's own configured clock —
-  align your deployment's timezone setting with what your DAGs expect, or
-  convert your intended local time yourself, rather than relying on the DAG's
-  `timezone=` (feature 3), which this sensor doesn't read.
+- `target_time` is evaluated against the DAG's own `timezone` setting (feature
+  3) — a DAG declared `timezone="America/New_York"` with
+  `target_time="09:00"` waits for 09:00 US Eastern, whatever timezone the
+  underlying infrastructure runs in.
 - Always targets **today's** date — a backfill run representing a historical
   date still waits for `target_time` on whatever day it actually executes.
 - If the condition is already true when the sensor first checks (e.g. it's
@@ -2368,13 +2388,20 @@ target time of day.
 ```python
 from dag_parser.dynamic.operators import TimeSensor
 
-wait_until_market_open = TimeSensor(
-    task_id="wait_until_market_open",
-    target_time="09:30:00",
-    poke_interval=60,
-    timeout=3600 * 2,
-    mode="reschedule",
-)
+with DAG(
+    dag_id="regional_market_open",
+    schedule="@daily",
+    timezone="America/New_York",
+    start_date=datetime(2026, 1, 1),
+) as dag:
+
+    wait_until_market_open = TimeSensor(
+        task_id="wait_until_market_open",
+        target_time="09:30:00",   # 09:30 US Eastern, matching the DAG's timezone
+        poke_interval=60,
+        timeout=3600 * 2,
+        mode="reschedule",
+    )
 ```
 
 ---
@@ -2572,11 +2599,11 @@ already covered individually, so you can see how they fit together as a system.
   abandoned-run safety net that only fires when a run has genuinely gone quiet
   (no task actively heartbeating) — a healthy, slow DAG is never killed by that
   global fallback alone.
-- **Retry backoff** (feature 13) applies to the normal in-process failure path.
-  A task recovered after its worker process itself was restarted (rather than
-  the task failing cleanly on its own) retries using the plain fixed
-  `retry_delay_seconds`, not the exponential curve — worth knowing if you see an
-  occasional retry that doesn't follow your configured backoff curve exactly.
+- **Retry backoff** (feature 13) applies consistently to every retryable
+  failure, whatever caused it — including a task recovered after its worker
+  process itself was restarted, not just an ordinary in-process failure. You can
+  rely on your configured fixed or exponential backoff curve regardless of the
+  underlying cause.
 - When a run is force-failed by a timeout, its still-`running`/`scheduled`/
   `queued`/`up_for_retry` tasks are swept into `failed` along with it. Tasks that
   are `deferred` (feature 28) or `up_for_reschedule` (feature 51) at that moment
@@ -2647,24 +2674,26 @@ fix_path_example = BashOperator(
 
 ### 55. SQL databases
 
-**What it does:** Running a query against a data warehouse connection.
+**What it does:** Running a query against a data warehouse or database
+connection. `SnowflakeOperator`, `SQLExecuteQueryOperator`, `MySqlOperator`,
+`PostgresOperator`, and `RedshiftOperator` all share the same shape — `sql=`
+plus `connection_id=` — pick whichever matches your connection's type.
 
-**Parameters (`SnowflakeOperator`):**
+**Parameters:**
 
 | Param | Type | Notes |
 |---|---|---|
-| `connection_id` | string | Must reference an existing Snowflake connection. |
+| `connection_id` | string | Must reference an existing connection of the matching type. |
 | `sql` | string | The query to run. |
-| `parameters` | dict | Substituted into the SQL text as `{{key}}` placeholders — see below. |
+| `parameters` | dict | Bound into the query as real parameterized-query placeholders. |
 
 **How it works:**
-- `SnowflakeOperator` is the supported way to run SQL against a warehouse today.
-- `parameters` is a literal find-and-replace of `{{key}}` inside your SQL
-  string, not a real parameterized-query bind — there's no automatic
-  escaping/quoting/type coercion. If any parameter value could ever come from
-  user-controlled input (e.g. a manually-triggered run's `conf`), quote/escape it
-  yourself before passing it in, exactly as if you were hand-building the SQL
-  string.
+- Use `SnowflakeOperator` for Snowflake, and `SQLExecuteQueryOperator`
+  (database-agnostic) or the type-specific `MySqlOperator`/`PostgresOperator`/
+  `RedshiftOperator` for the matching database.
+- `parameters` values are bound as real query parameters, not string-substituted
+  into the SQL text — passing user-supplied values (e.g. from a manually
+  triggered run's `conf`) is safe without any manual escaping on your part.
 - Only the first result row is captured as `return_value` (feature 37) — a
   query returning many rows drops everything after row 1.
 - `SnowflakeOperator` maintains a connection pool per `connection_id` that
@@ -2674,12 +2703,20 @@ fix_path_example = BashOperator(
 
 **Example:**
 ```python
+from dag_parser.dynamic.dag_context import PostgresOperator
+
 extract = SnowflakeOperator(
     task_id="extract",
     connection_id="snowflake_prod",
-    sql="SELECT * FROM sales.orders WHERE region = '{{region}}'",  # NOT a real bind —
-    parameters={"region": "US-WEST"},  # this is literal string substitution;
-                                        # quote/escape values yourself if untrusted
+    sql="SELECT * FROM sales.orders WHERE region = %(region)s",
+    parameters={"region": "US-WEST"},   # safely bound, not string-substituted
+)
+
+load_summary = PostgresOperator(
+    task_id="load_summary",
+    connection_id="reporting_pg",
+    sql="INSERT INTO summary (region, total) VALUES (%(region)s, %(total)s)",
+    parameters={"region": "US-WEST", "total": 12000},
 )
 ```
 
@@ -2694,9 +2731,9 @@ extract = SnowflakeOperator(
 
 | Param | Type | Notes |
 |---|---|---|
-| `s3_conn_id` / `iam_role` | string | Pick **one** auth method — if `iam_role` is set, it's used exclusively and `s3_conn_id` is not resolved at all. |
-| `region` | string | Only falls back to the connection's stored region in access-key (`s3_conn_id`) mode — set it explicitly alongside `iam_role`. |
-| `truncate` | boolean | Runs as its own statement, separate from the `COPY` that follows. |
+| `s3_conn_id` / `iam_role` | string | Provide exactly one — whichever is set determines the auth method used for the `COPY`. |
+| `region` | string | Falls back to the connection's stored region if omitted, in either auth mode. |
+| `truncate` | boolean | Runs in the same transaction as the following `COPY`. |
 | `s3_key` | string | Wildcards supported. |
 
 **Parameters (`GCSToBigQueryOperator`):**
@@ -2705,21 +2742,22 @@ extract = SnowflakeOperator(
 |---|---|---|
 | `source_format` | string | e.g. `PARQUET`, `CSV`. |
 | `write_disposition` | string | e.g. `WRITE_TRUNCATE`. |
-| `autodetect` | boolean | Schema auto-detection. |
-| `schema_fields` | list | Explicit schema — can be set alongside `autodetect`; BigQuery's own API resolves any ambiguity. |
-| `poll_interval` | integer (seconds) | Polling cadence only — not a maximum wait. |
+| `autodetect` | boolean | Schema auto-detection. Set exactly one of `autodetect`/`schema_fields`. |
+| `schema_fields` | list | Explicit schema. Set exactly one of `autodetect`/`schema_fields`. |
+| `poll_interval` | integer (seconds) | Polling cadence; the load job is bounded by the task's `execution_timeout`. |
 
 **How it works:**
-- `truncate=True` runs `TRUNCATE` and the subsequent `COPY` as two separate
-  steps, not one atomic operation — if `COPY` then fails, the table is left
-  truncated. Treat `truncate=True` as "clear now, then try to reload," and make
-  sure your downstream error handling accounts for that.
-- Set `region=` explicitly whenever you use `iam_role` auth — it isn't resolved
-  from a connection in that mode.
-- `GCSToBigQueryOperator`'s poll loop has no maximum wait of its own — it relies
-  entirely on the task's own `execution_timeout` (feature 16) or the
-  deployment's global default. Set `execution_timeout` explicitly if you need a
+- `truncate=True` and the subsequent `COPY` run inside a single transaction —
+  if `COPY` fails for any reason, the truncate is rolled back and the table
+  keeps its original data.
+- Set exactly one of `iam_role`/`s3_conn_id` — the operator validates this at
+  DAG-parse time.
+- `GCSToBigQueryOperator`'s poll loop tolerates a transient status-check error
+  (retrying rather than failing the task immediately) and is bounded by the
+  task's `execution_timeout` (feature 16) — set that explicitly if you need a
   hard cap on how long a load job is allowed to run.
+- `autodetect` and `schema_fields` are mutually exclusive — set exactly one;
+  the operator validates this at DAG-parse time.
 - `destination_project`/`destination_dataset` fall back to the connection's
   stored defaults if omitted from the task — the same connection can target
   different datasets depending on whether a given task fills these in.
@@ -2735,7 +2773,7 @@ load_from_s3 = S3ToRedshiftOperator(
     table="orders",
     schema="public",
     copy_options="CSV IGNOREHEADER 1 GZIP",
-    truncate=False,   # True clears the table immediately, before COPY runs
+    truncate=True,   # truncate + COPY run as a single atomic transaction
 )
 
 load_from_gcs = GCSToBigQueryOperator(
@@ -2749,7 +2787,7 @@ load_from_gcs = GCSToBigQueryOperator(
     write_disposition="WRITE_TRUNCATE",
     autodetect=True,
     poll_interval=10,
-    execution_timeout=1800,   # bound the otherwise-unbounded poll loop
+    execution_timeout=1800,   # ceiling for the load job
 )
 ```
 
@@ -2760,11 +2798,19 @@ load_from_gcs = GCSToBigQueryOperator(
 **What it does:** Makes a single HTTP request as a task step — distinct from
 `HttpSensor` (feature 46), which polls repeatedly waiting for a condition.
 
+**Parameters (`HttpOperator`):**
+
+| Param | Type | Notes |
+|---|---|---|
+| `url` | string | Renders through Go templating (feature 38). |
+| `method` | string | e.g. `GET`, `POST`. |
+| `headers` | dict | |
+| `body` | string | |
+| `connection_id` | string | Optional — resolves stored auth for the target endpoint. |
+
 **How it works:**
-- There's no ready-made HTTP-call operator class to import — define a thin
-  `BaseOperator` subclass with `operator_name = "http"` and pass
-  `url`/`method`/`headers`/`body` as constructor kwargs; they flow through to the
-  executor automatically.
+- `HttpOperator` (also importable as `SimpleHttpOperator`) is a ready-made
+  class — no need to subclass `BaseOperator` yourself.
 - `url`/`headers`/`body` render through Go templating (feature 38), not Jinja.
 - A response is truncated at 1MB, and any 2xx counts as success — there's no
   response-body validation option here (that's `HttpSensor`-only); add a
@@ -2773,17 +2819,14 @@ load_from_gcs = GCSToBigQueryOperator(
 
 **Example:**
 ```python
-from dag_parser.dynamic.dag_context import BaseOperator
+from dag_parser.dynamic.operators import HttpOperator
 
-class HttpCallOperator(BaseOperator):
-    """A thin wrapper for a one-shot HTTP call task."""
-    operator_name = "http"
-
-notify_downstream = HttpCallOperator(
+notify_downstream = HttpOperator(
     task_id="notify_downstream",
     url="https://api.example.com/v1/events",
     method="POST",
-    headers={"Content-Type": "application/json", "Authorization": "Bearer token"},
+    headers={"Content-Type": "application/json"},
+    connection_id="internal_api",
     body='{"event": "pipeline_complete", "dag_id": "{{ .DagID }}"}',
 )
 ```
@@ -2798,15 +2841,14 @@ notify_downstream = HttpCallOperator(
 
 | Param | Type | Notes |
 |---|---|---|
-| `connection_id` | string | Provides host/auth (password or private key — key is tried first if both are present). |
+| `connection_id` | string | Provides host/auth (password or private key — key is tried first if both are present) and the expected host key/fingerprint. |
 | `command` | string | The remote command to run. |
 | `environment` | dict | Best-effort — see below. |
 
 **How it works:**
-- SSH connections made by this operator do not perform host key verification —
-  treat SSH targets as you would any connection without host pinning, and avoid
-  routing sensitive traffic through untrusted networks where a man-in-the-middle
-  substitution is a realistic concern.
+- SSH connections verify the remote host's key against the fingerprint stored
+  on the connection — set this when creating the connection so PI-Flow can
+  detect an unexpected host on the other end.
 - `environment={}` may be silently ignored by the remote server depending on its
   `sshd_config` (most servers reject arbitrary `SetEnv` requests unless
   explicitly allowlisted) — a rejected env var is only logged as a warning, never
@@ -2824,7 +2866,7 @@ from dag_parser.dynamic.operators import SSHOperator
 
 remote_cleanup = SSHOperator(
     task_id="remote_cleanup",
-    connection_id="prod_bastion",
+    connection_id="prod_bastion",   # host key verified against the connection's stored fingerprint
     command="rm -rf /tmp/staging/{{ .DS }}",
     environment={"STAGE": "prod"},  # may be silently dropped by sshd's AcceptEnv config
 )
@@ -2844,9 +2886,12 @@ step.
 | Param | Type | Notes |
 |---|---|---|
 | `to` | list of strings | *required* |
-| `subject` | string | Sent as-is — no token substitution here. |
-| `html_content` | string | Supports 3 tokens: `{{dag_id}}`, `{{task_id}}`, `{{run_id}}`. |
+| `subject` | string | Supports the same `{{dag_id}}`/`{{task_id}}`/`{{run_id}}` tokens as `html_content`. |
+| `html_content` | string | Supports the same tokens. |
 | `cc` / `bcc` | list of strings | Optional. |
+| `from_email` | string | Overrides the deployment's default SMTP "from" address for this task. |
+| `files` | list of file paths | Attached to the outgoing email. |
+| `custom_headers` | dict | Added to the outgoing MIME message. |
 
 **Parameters (`SlackAPIPostOperator`):**
 
@@ -2858,11 +2903,11 @@ step.
 | `unfurl_links` | boolean | Only has an effect with a token-mode connection. |
 
 **How it works:**
-- Every `EmailOperator` message sends from the deployment's globally-configured
-  SMTP address — there's no per-task override for the "from" address.
-- `EmailOperator`'s token substitution only applies to `html_content`, not
-  `subject` — put any `{{dag_id}}`-style placeholder in the body, not the
-  subject line, if you need it substituted.
+- Set `from_email` to override the "from" address for that specific task;
+  leave it unset to use the deployment's globally-configured SMTP address.
+- `subject` and `html_content` are both token-substituted the same way.
+- `files` attaches the listed local file paths to the outgoing email;
+  `custom_headers` are added as extra header lines on the outgoing message.
 - `SlackAPIPostOperator`'s `return_value` shape depends on the connection's
   mode: webhook mode returns Slack's raw response body (typically `"ok"`);
   token mode returns `{"ts": "<message timestamp>"}`. A downstream task reading
@@ -2876,8 +2921,11 @@ from dag_parser.dynamic.dag_context import SlackAPIPostOperator
 send_report = EmailOperator(
     task_id="send_report",
     to=["team@company.com"],
-    subject="Daily report",                              # not substituted — sent literally
-    html_content="<p>Report for {{ dag_id }} run {{ run_id }}</p>",  # IS substituted
+    subject="Report for {{dag_id}}",       # substituted
+    html_content="<p>Report for {{ dag_id }} run {{ run_id }}</p>",
+    from_email="pipeline-alerts@company.com",
+    files=["/tmp/report.csv"],
+    custom_headers={"X-Priority": "1"},
 )
 
 post_to_slack = SlackAPIPostOperator(
@@ -2885,6 +2933,7 @@ post_to_slack = SlackAPIPostOperator(
     connection_id="slack_bot_token",   # token-mode: channel is REQUIRED
     channel="#data-alerts",
     text="Report generation complete",
+    unfurl_links=True,
 )
 ```
 
@@ -2902,17 +2951,20 @@ it to finish.
 |---|---|---|---|
 | `task_type` | string | `"notebook_task"` | One of `notebook_task`, `spark_python_task`, `spark_jar_task`. |
 | `cluster_id` | string | connection's stored default, if any | Falls back to the connection's own `extra.cluster_id` if omitted. |
-| `new_cluster` | dict | none | If set (non-empty), it's used **instead of** `cluster_id` — the two are not merged. |
-| `poll_interval` | integer (seconds) | — | Polling cadence, not a maximum wait. |
+| `new_cluster` | dict | none | Set exactly one of `cluster_id`/`new_cluster` — the operator validates this at DAG-parse time. |
+| `poll_interval` | integer (seconds) | — | Polling cadence; the poll loop tolerates a transient status-check error and is bounded by `execution_timeout`. |
 | `idempotency_token` | string | none | Passed unchanged on every retry attempt. |
 
 **How it works:**
-- Set exactly one of `cluster_id` or `new_cluster` per task — if both are set,
-  `new_cluster` wins outright.
+- Set exactly one of `cluster_id` or `new_cluster` per task — setting both (or
+  neither, with no connection default available) raises a clear validation
+  error at DAG-parse time.
 - `cluster_id` falls back to the connection's own stored default if you omit it
   from the task — handy if most tasks target the same cluster.
-- The poll loop has no maximum wait of its own — set `execution_timeout` (feature
-  16) explicitly to bound how long you're willing to wait for a Databricks job.
+- The poll loop tolerates a single transient HTTP error (retrying rather than
+  failing the task immediately) and is bounded by the task's `execution_timeout`
+  (feature 16) — set that explicitly to cap how long you're willing to wait for
+  a Databricks job.
 - A `notebook_task` that calls `dbutils.notebook.exit(...)` is the most reliable
   way to get a meaningful `return_value` back — `spark_python_task`/
   `spark_jar_task` runs typically don't populate one the same way.
@@ -2951,16 +3003,15 @@ or wait on state outside the current DAG's own task graph:
 **How it works:**
 - `TriggerDagRunOperator`'s `wait_for_completion=True` uses the same lightweight,
   slot-free waiting mechanism described in feature 27 — it does not hold a
-  worker slot, unlike a `mode="poke"` sensor.
+  worker slot, unlike a `mode="poke"` sensor. Its `poke_interval` controls how
+  often the background reconciler checks the child run's state while waiting.
+- `TriggerDagRunOperator` is treated as lightweight coordination work for
+  scheduling purposes, the same as the sensors — it is not subject to the same
+  admission limits as CPU-heavy Python/Bash tasks, so it stays responsive even
+  under system load.
 - The sensors (Part 8) each wait on a *condition* (an HTTP check, a SQL query, a
   clock, or another task/DAG's state) using the poke/reschedule model
   (feature 51).
-- Under sustained system load, keep in mind that lightweight coordination tasks
-  like `TriggerDagRunOperator` share the same local-task scheduling treatment as
-  CPU-heavy Python/Bash work in the current implementation — if you have DAGs
-  that rely heavily on chained `TriggerDagRunOperator` calls, be aware they can
-  be throttled alongside genuinely CPU-bound tasks under high load, rather than
-  being treated as lightweight coordination work.
 
 **Example:**
 ```python
@@ -2973,6 +3024,7 @@ with DAG(dag_id="orchestrator", schedule="@daily", start_date=datetime(2026, 1, 
         task_id="trigger_child",
         trigger_dag_id="child_pipeline",
         wait_for_completion=True,
+        poke_interval=30,   # how often the reconciler checks the child run's state
     )
 
     wait_for_sibling = ExternalTaskSensor(
