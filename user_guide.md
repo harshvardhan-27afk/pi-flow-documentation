@@ -144,7 +144,7 @@ description and tags so people (and the search box) can find it later.
   in the repo declare the same `dag_id`, whichever one is ingested last "wins" and
   overwrites the other in storage — keep `dag_id`s unique per file.
 - Keep `description` short — it's meant for a list view, not a full README.
-- `owners` is a common Airflow convention but is not part of PI-Flow's DAG-level
+- `owners` is a common  convention but is not part of PI-Flow's DAG-level
   metadata today — if you want to record an owning team, put it in `description`
   or `tags` as a convention.
 
@@ -1156,7 +1156,7 @@ extra environment variables, which interpreter runs it, and (for
 | `append_env` | boolean | `True` | `True` = layer `env` on top of the default safe allowlist. `False` = only the bare essentials plus your `env`. |
 | `python` (`ExternalPythonOperator`) | string (absolute path) | none | Run under a specific pre-provisioned interpreter. |
 | `venv` (`PythonVirtualenvOperator`) | string, matches `[A-Za-z0-9_-]+` | none | Name of an already-built managed environment. |
-| `requirements` (`PythonVirtualenvOperator`) | list of strings | none | Airflow-style pip requirement list; derives a deterministic environment name. Exactly one of `venv`/`requirements` must be set. |
+| `requirements` (`PythonVirtualenvOperator`) | list of strings | none |  pip requirement list; derives a deterministic environment name. Exactly one of `venv`/`requirements` must be set. |
 
 **How it works:**
 - By design, tasks never inherit the orchestrator's own environment — you get a
@@ -1199,7 +1199,7 @@ PythonVirtualenvOperator(
     venv="pandas_env",   # must already be built by an admin
 )
 
-# PythonVirtualenvOperator — Airflow-style requirements (auto-derived env name)
+# PythonVirtualenvOperator —  requirements (auto-derived env name)
 PythonVirtualenvOperator(
     task_id="run_with_requirements",
     python_callable=lambda: None,
@@ -1944,7 +1944,7 @@ regional_extract = BashOperator(
 **What it does:** Python-family operators (`PythonOperator`,
 `ExternalPythonOperator`, `PythonVirtualenvOperator`) render their
 `op_args`/`op_kwargs`/`templates_dict` with a full Jinja2 engine, giving access to
-the complete Airflow-style context.
+the complete context.
 
 **Available context:**
 
