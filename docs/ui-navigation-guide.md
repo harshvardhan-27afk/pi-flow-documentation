@@ -16,7 +16,7 @@ contents below.
 ## Table of Contents
 
 - [Signing In](#signing-in)
-- [Application Shell](#application-shell)
+- [Quick-Navigation-Bars](#application-shell)
 - [Home](#home)
 - [Dags](#dags)
   - [Dag Detail](#dag-detail)
@@ -62,7 +62,7 @@ of these full-page states instead of the normal app UI:
 
 ---
 
-## Quick-Nav-Bars
+## Quick-Navigation-Bars
 
 Once your identity resolves, every page in Maestro-Pi shares the same shell: a
 left **icon sidebar** for getting around, and a top **navigation bar** for
