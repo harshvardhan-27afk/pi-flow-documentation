@@ -1,14 +1,14 @@
-# Maestro-Pi UI Navigation Guide
+# Maestro-π UI Navigation Guide
 
-Welcome to Maestro-Pi! This guide walks you through every screen in the Maestro-Pi
+Welcome to Maestro-π! This guide walks you through every screen in the Maestro-π
 web UI — what you'll see, what each element on the page does, and the
 actions you can take from it. Read it top to bottom if you're new, or jump
 straight to the section for the screen you're looking at using the table of
 contents below.
 
-> **Signed in via Snowflake.** Maestro-Pi doesn't have its own sign-in form —
+> **Signed in via Snowflake.** Maestro-π doesn't have its own sign-in form —
 > authentication is handled entirely by Snowflake (SPCS ingress). You open the
-> app already signed in as your Snowflake user, and Maestro-Pi reads that
+> app already signed in as your Snowflake user, and Maestro-π reads that
 > identity automatically. See [Signing In](#signing-in) for details.
 
 ---
@@ -38,19 +38,19 @@ contents below.
 **Route:** none — signing in happens outside the app itself.
 
 Authentication is delegated entirely to Snowflake. When you open the app
-(from Snowsight or via the SPCS ingress URL), Maestro-Pi reads your
+(from Snowsight or via the SPCS ingress URL), Maestro-π reads your
 already-established Snowflake identity from `/api/auth/me` — there's no
 username/password form to fill in.
 
 While that identity is resolving, or if it can't be resolved, you'll see one
 of these full-page states instead of the normal app UI:
 
-- **Loading** — a centered spinner shown for a moment while Maestro-Pi calls
+- **Loading** — a centered spinner shown for a moment while Maestro-π calls
   `/api/auth/me`.
 - **"Access not provisioned"** — shown when you're authenticated to Snowflake
-  but your Snowflake user hasn't been added to Maestro-Pi yet. Ask a Maestro-Pi
+  but your Snowflake user hasn't been added to Maestro-π yet. Ask a Maestro-π
   Admin to add you from [Admin → Users](#admin--users).
-- **"Unable to verify identity"** — shown when Maestro-Pi can't determine your
+- **"Unable to verify identity"** — shown when Maestro-π can't determine your
   Snowflake identity at all (for example, running the frontend locally
   outside of the Snowflake ingress). Open the app from Snowflake instead.
 
@@ -64,7 +64,7 @@ of these full-page states instead of the normal app UI:
 
 ## Quick-Navigation-Bars
 
-Once your identity resolves, every page in Maestro-Pi shares the same shell: a
+Once your identity resolves, every page in Maestro-π shares the same shell: a
 left **icon sidebar** for getting around, and a top **navigation bar** for
 theme and account info. Get familiar with these two pieces first — they stay
 the same no matter which section of the app you're in.
@@ -87,13 +87,13 @@ blue. From top to bottom:
 
 ### Top navigation bar
 
-- **Maestro-Pi logo** (left) — click it to go Home
+- **Maestro-π logo** (left) — click it to go Home
 - **Theme toggle** (sun/moon icon) — switches light/dark mode
 - **User avatar + username + role list** (right)
 
 There's  no separate sign-out
 button — since Snowflake owns your session, signing out happens through
-Snowflake, not Maestro-Pi.
+Snowflake, not Maestro-π.
 
 ### Common actions
 
@@ -144,7 +144,7 @@ DAGs; use [Dags](#dags) for that.
 
 ### Description :
 
-The full list of workflows (DAGs) registered in Maestro-Pi, with search, filter,
+The full list of workflows (DAGs) registered in Maestro-π, with search, filter,
 sort, pagination, and per-row actions.
 
 ### Key elements
@@ -349,7 +349,7 @@ Slides in from the right when you click a task row or graph node.
 
 ### Description :
 
-An overview of every external system type Maestro-Pi can connect to (databases,
+An overview of every external system type Maestro-π can connect to (databases,
 cloud storage, messaging, compute), grouped by category, with a count of
 existing connections per type.
 
@@ -502,16 +502,16 @@ magnitude rather than sorted into fixed on-time/late buckets.
 
 ### Description :
 
-Provisioning: since Maestro-Pi never stores passwords, "creating a user" here
+Provisioning: since Maestro-π never stores passwords, "creating a user" here
 means picking an existing Snowflake user and granting them roles so they can
-sign in and use Maestro-Pi. A quick link at the top jumps to Roles & Permissions.
+sign in and use Maestro-π. A quick link at the top jumps to Roles & Permissions.
 
 ### Key elements
 
 - Quick link: **Roles & Permissions →**
 - **Add User** button, expanding a form:
   - **Snowflake user** — a searchable combobox listing real Snowflake
-    account users not yet provisioned in Maestro-Pi (falls back to a free-text
+    account users not yet provisioned in Maestro-π (falls back to a free-text
     login-name field if the live Snowflake user list can't be reached)
   - **Email** (optional, used only for alert notifications)
   - **Assign roles** — a grid of role cards to toggle on/off
@@ -528,7 +528,7 @@ sign in and use Maestro-Pi. A quick link at the top jumps to Roles & Permissions
   their Snowflake identity — no password to set.
 - Click a role pill on a user's row to grant/revoke that role.
 - Click **Disable** to deactivate an account without deleting it, or
-  **Remove** to drop it from Maestro-Pi permanently (their Snowflake account is
+  **Remove** to drop it from Maestro-π permanently (their Snowflake account is
   unaffected either way).
 
 ---

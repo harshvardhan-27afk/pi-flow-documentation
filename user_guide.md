@@ -1,6 +1,6 @@
-# PI-Flow DAG Authoring Guide
+# Maestro-π DAG Authoring Guide
 
-This guide teaches you how to **author DAGs** (workflows) for PI-Flow — the Python
+This guide teaches you how to **author DAGs** (workflows) for Maestro-π — the Python
 syntax, the parameters each feature accepts, and how each feature actually behaves
 once your DAG is running. 
 
@@ -12,7 +12,7 @@ once your DAG is running.
 
 ### What is a DAG?
 
-A **DAG** (Directed Acyclic Graph) is just PI-Flow's word for "a workflow." You
+A **DAG** (Directed Acyclic Graph) is just Maestro-π's word for "a workflow." You
 write it as a plain Python file. It describes:
 
 - **What work needs to happen** — a set of individual steps, called **tasks**.
@@ -37,7 +37,7 @@ with DAG(
 ) as dag:
 
     def say_hello():
-        print("Hello from PI-Flow!")
+        print("Hello from Maestro-π!")
 
     hello_task = PythonOperator(
         task_id="say_hello",
@@ -45,7 +45,7 @@ with DAG(
     )
 ```
 
-Save this as a `.py` file in the `dags/` folder of your team's Git repo. PI-Flow
+Save this as a `.py` file in the `dags/` folder of your team's Git repo. Maestro-π
 periodically pulls that repo, notices the new/changed file, and parses it — no
 manual upload step. From that point on, `hello_world` shows up in the UI and starts
 producing scheduled runs.
@@ -90,9 +90,9 @@ none → scheduled → queued → running → success
 
 You don't need to know the internals to author DAGs, but the short version helps
 explain some behavior later in this guide: your DAG file lives in a Git repository;
-PI-Flow periodically fetches that repo, detects new/changed `.py` files, and parses
+Maestro-π periodically fetches that repo, detects new/changed `.py` files, and parses
 them. Once parsed, your DAG's structure (tasks, schedule, dependencies) is recorded,
-and from then on PI-Flow's scheduler takes over — creating runs, planning tasks, and
+and from then on Maestro-π's scheduler takes over — creating runs, planning tasks, and
 dispatching them to run, all without your file being touched again until you edit
 it and push a new commit.
 
@@ -140,11 +140,11 @@ description and tags so people (and the search box) can find it later.
 | `start_date` | `datetime` | *required for scheduled DAGs* | See feature 3. |
 
 **How it works:**
-- Because `dag_id` is the primary key PI-Flow uses to store your DAG, if two files
+- Because `dag_id` is the primary key Maestro-π uses to store your DAG, if two files
   in the repo declare the same `dag_id`, whichever one is ingested last "wins" and
   overwrites the other in storage — keep `dag_id`s unique per file.
 - Keep `description` short — it's meant for a list view, not a full README.
-- `owners` is a common  convention but is not part of PI-Flow's DAG-level
+- `owners` is a common  convention but is not part of Maestro-π's DAG-level
   metadata today — if you want to record an owning team, put it in `description`
   or `tags` as a convention.
 
@@ -174,7 +174,7 @@ with DAG(
 
 ### 2. Schedule
 
-**What it does:** Decides when PI-Flow automatically creates a new run of your
+**What it does:** Decides when Maestro-π automatically creates a new run of your
 DAG. There are three ways to schedule a DAG: a cron expression, a named
 "timetable," or a dataset (run when upstream data changes rather than on a
 clock).
@@ -269,7 +269,7 @@ timezone its cron expression should be interpreted.
 | `timezone` | string (IANA name, e.g. `"America/New_York"`) | `"UTC"` | Timezone used to evaluate the cron expression's wall-clock time. |
 
 **How it works:**
-- `start_date` is the anchor PI-Flow uses to calculate the first (and, with
+- `start_date` is the anchor Maestro-π uses to calculate the first (and, with
   catchup, every subsequent) scheduled run — without it, there's no reference
   point.
 - `timezone` affects the cron's wall-clock meaning: `"10 11 * * *"` means 11:10 in
@@ -296,7 +296,7 @@ with DAG(
 
 ### 4. Catchup & backfill toggle
 
-**What it does:** Controls whether PI-Flow fills in every schedule interval that
+**What it does:** Controls whether Maestro-π fills in every schedule interval that
 was "missed" between `start_date` and now, or only starts scheduling from the most
 recent interval going forward.
 
@@ -308,7 +308,7 @@ recent interval going forward.
 
 **How it works:**
 - With `catchup=True` (the default) and a `start_date` set far in the past on a
-  frequent schedule, PI-Flow will gradually create every missed run — a handful per
+  frequent schedule, Maestro-π will gradually create every missed run — a handful per
   scheduler cycle, not all at once — until it's caught up to "now."
 - For most "just run going forward" DAGs, set `catchup=False` explicitly so
   ingesting the DAG for the first time doesn't produce a flood of historical runs.
@@ -357,7 +357,7 @@ running at once.
 | `max_active_tasks` | integer | `None` (no DAG-level cap) | Cap on concurrent task instances across **all** of this DAG's active runs combined. |
 
 **How it works:**
-- If `max_active_runs` is reached, PI-Flow simply doesn't create the next
+- If `max_active_runs` is reached, Maestro-π simply doesn't create the next
   scheduled run yet — it waits for a slot to free up rather than skipping or
   queuing indefinitely.
 - `max_active_tasks` applies across **all runs of the DAG combined**, not
@@ -1213,7 +1213,7 @@ PythonVirtualenvOperator(
 
 ### 23. Automatic runs
 
-**What it does:** How PI-Flow actually turns your `schedule`/`timetable` (Part 1)
+**What it does:** How Maestro-π actually turns your `schedule`/`timetable` (Part 1)
 into real `dag_run` rows, with no action needed on your part.
 
 **How it works:**
@@ -1904,7 +1904,7 @@ templating pass before execution.
 | `{{ .ExecutionDate }}` / `{{ .LogicalDate }}` | Full ISO8601. |
 | `{{ .DagID }}` / `{{ .TaskID }}` / `{{ .RunID }}` / `{{ .TryNumber }}` / `{{ .MapIndex }}` | Identity fields. |
 | `{{ .Params.key }}` / `{{ .Conf.key }}` | Your declared params / the triggering run's `conf`. |
-| `{{ .Var.key }}` | A PI-Flow Variable (feature 40). |
+| `{{ .Var.key }}` | A Maestro-π Variable (feature 40). |
 | `ds_add .DS <days>` | Add/subtract days from a `YYYY-MM-DD` string. |
 | `ds_format .DS "<layout>"` | Reformat a `YYYY-MM-DD` string (Go date-layout syntax). |
 | `ts_add .ExecutionDate "<duration>"` | Add a duration to a full timestamp. |
@@ -2081,7 +2081,7 @@ notify_failure = PythonOperator(
             "on_failure": {
                 "type": "email",
                 "to": ["oncall@company.com"],
-                "subject": "PI-Flow failure: {{dag_id}}.{{task_id}}",
+                "subject": "Maestro-π failure: {{dag_id}}.{{task_id}}",
                 "html_content": "<p>Run <b>{{run_id}}</b> failed on event {{event}}.</p>",
             }
         }
@@ -2847,7 +2847,7 @@ notify_downstream = HttpOperator(
 
 **How it works:**
 - SSH connections verify the remote host's key against the fingerprint stored
-  on the connection — set this when creating the connection so PI-Flow can
+  on the connection — set this when creating the connection so Maestro-π can
   detect an unexpected host on the other end.
 - `environment={}` may be silently ignored by the remote server depending on its
   `sshd_config` (most servers reject arbitrary `SetEnv` requests unless
